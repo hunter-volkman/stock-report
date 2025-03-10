@@ -14,19 +14,48 @@ class WorkbookProcessor:
     def __init__(self, work_dir, export_script, api_key_id, api_key, org_id, 
                  timezone="America/New_York", export_start_time="7:00", export_end_time="19:00"):
         self.work_dir = work_dir
-        self.export_script = export_script
+        self.export_script_path = export_script
+        self.export_script_dir = os.path.dirname(export_script)
         self.api_key_id = api_key_id
         self.api_key = api_key
         self.org_id = org_id
         self.timezone = timezone
         self.export_start_time = export_start_time
-        self.export_end_time = export_en
+        self.export_end_time = export_end_time
         # Check if LibreOffice is available for formula recalculation
         self.libreoffice_available = self._check_libreoffice()
         if self.libreoffice_available:
             LOGGER.info("LibreOffice is available for formula recalculation")
         else:
             LOGGER.warning("LibreOffice not found - complex formula recalculation may be limited")
+
+        # Check for viam-python-data-export virtual environment
+        self.venv_path = os.path.join(self.export_script_dir, ".venv")
+        if not os.path.exists(self.venv_path):
+            LOGGER.warning(f"viam-python-data-export virtual environment not found at {self.venv_path}, attempting to set it up")
+            self._setup_venv()
+        else:
+            LOGGER.info(f"Found viam-python-data-export virtual environment at {self.venv_path}")
+    
+    def _setup_venv(self):
+        """Set up the virtual environment for viam-python-data-export if it doesn't exist"""
+        try:
+            setup_script = os.path.join(self.export_script_dir, "setup.sh")
+            if os.path.exists(setup_script):
+                LOGGER.info(f"Running setup script for viam-python-data-export: {setup_script}")
+                # Cannot source the script directly (can simulate it)
+                # Running bash with -c and sourcing the script
+                subprocess.run(
+                    ["bash", "-c", f"cd {self.export_script_dir} && source ./setup.sh"],
+                    check=True,
+                    shell=False
+                )
+                LOGGER.info("viam-python-data-export setup script completed successfully!")
+            else:
+                LOGGER.error(f"Setup script not found at {setup_script}")
+        except Exception as e:
+            LOGGER.error(f"Failed to set up viam-python-data-export virtual environment: {e}")
+
 
     def _check_libreoffice(self):
         """Check if LibreOffice is available on the system."""
@@ -59,9 +88,17 @@ class WorkbookProcessor:
         end_time = yesterday.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
 
         LOGGER.info(f"Exporting data from {start_time} to {end_time} ({self.export_start_time} to {self.export_end_time})")
-        
+
+        # Construct the shell script to run vde.py with its virtual environment
+        venv_python = os.path.join(self.venv_path, "bin", "python")
+        export_script_path = self.export_script_path
+
+        # Build the command        
         cmd = [
-            "python3", self.export_script, "-vv", "excel",
+            venv_python,
+            export_script_path,
+            "-vv", 
+            "excel",
             "--apiKeyId", self.api_key_id,
             "--apiKey", self.api_key,
             "--orgId", self.org_id,
@@ -76,21 +113,35 @@ class WorkbookProcessor:
             "--tab", "RAW"
         ]
 
+        # Create a masked version of the command for logging
+        cmd_mask = cmd.copy()
+
+        # Find the index of the sensitive parameters and mask them
+        if "--apiKeyId" in masked_cmd:
+            idx = masked_cmd.index("--apiKeyId")
+            if idx + 1 < len(masked_cmd):
+                masked_cmd[idx + 1] = "<redacted>"
+        if "--apiKey" in masked_cmd:
+            idx = masked_cmd.index("--apiKey")
+            if idx + 1 < len(masked_cmd):
+                masked_cmd[idx + 1] = "<redacted>"
+
         try:
             # Run in the script's directory to handle relative paths
-            LOGGER.info(f"Running vde.py command: {' '.join(cmd)}")
+             # Log the masked command
+            LOGGER.info(f"Running vde.py command: {' '.join(cmd_mask)}")
             process = subprocess.run(
                 cmd, 
                 check=True, 
-                cwd=os.path.dirname(self.export_script),
+                cwd=self.export_script_dir,
                 capture_output=True,
                 text=True
             )
             
-            # Log important parts of the output, but not everything to avoid spamming logs
+            # Log important parts of the output but not everything to avoid spam
             stdout_lines = process.stdout.strip().split('\n')
             if stdout_lines:
-                # Log first 5 lines and last 5 lines if there's a lot of output
+                # Log first 5 lines and last 5 lines (if there's a lot of output)
                 if len(stdout_lines) > 10:
                     LOGGER.info("vde.py output first lines:")
                     for line in stdout_lines[:5]:
