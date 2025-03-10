@@ -117,14 +117,14 @@ class WorkbookProcessor:
         cmd_mask = cmd.copy()
 
         # Find the index of the sensitive parameters and mask them
-        if "--apiKeyId" in masked_cmd:
-            idx = masked_cmd.index("--apiKeyId")
-            if idx + 1 < len(masked_cmd):
-                masked_cmd[idx + 1] = "<redacted>"
-        if "--apiKey" in masked_cmd:
-            idx = masked_cmd.index("--apiKey")
-            if idx + 1 < len(masked_cmd):
-                masked_cmd[idx + 1] = "<redacted>"
+        if "--apiKeyId" in cmd_mask:
+            idx = cmd_mask.index("--apiKeyId")
+            if idx + 1 < len(cmd_mask):
+                cmd_mask[idx + 1] = "<redacted>"
+        if "--apiKey" in cmd_mask:
+            idx = cmd_mask.index("--apiKey")
+            if idx + 1 < len(cmd_mask):
+                cmd_mask[idx + 1] = "<redacted>"
 
         try:
             # Run in the script's directory to handle relative paths
