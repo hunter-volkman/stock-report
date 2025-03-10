@@ -72,7 +72,7 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.last_processed_time = None
         self.last_sent_date = None
         self.last_sent_time = None
-        self.processed_workbook_path = None
+        self.data = None
         self.report = "not_sent"
         self.workbook = "not_processed"
         self.loop_task = None
@@ -90,7 +90,7 @@ class EmailWorkbooks(Sensor, EasyResource):
                 self.last_processed_time = state.get("last_processed_time")
                 self.last_sent_date = state.get("last_sent_date")
                 self.last_sent_time = state.get("last_sent_time")
-                self.processed_workbook_path = state.get("processed_workbook_path")
+                self.data = state.get("data")
             LOGGER.info(f"Loaded state: last_processed_date={self.last_processed_date}, last_processed_time={self.last_processed_time}, last_sent_date={self.last_sent_date}, last_sent_time={self.last_sent_time}")
         else:
             LOGGER.info(f"No state file at {self.state_file}, starting fresh")
@@ -102,7 +102,7 @@ class EmailWorkbooks(Sensor, EasyResource):
             "last_processed_time": self.last_processed_time,
             "last_sent_date": self.last_sent_date,
             "last_sent_time": self.last_sent_time,
-            "processed_workbook_path": self.processed_workbook_path
+            "data": self.data
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f)
@@ -233,8 +233,8 @@ class EmailWorkbooks(Sensor, EasyResource):
 
         try:
             LOGGER.info(f"Processing workbook using template {master_template}")
-            workbook_path = self.processor.process(master_template)
-            self.processed_workbook_path = workbook_path
+            data_path = self.processor.process(master_template)
+            self.data = workbook_path
             self.last_processed_date = date_str
             self.last_processed_time = str(timestamp)
             self.workbook = "processed"
@@ -248,13 +248,13 @@ class EmailWorkbooks(Sensor, EasyResource):
 
     async def send_processed_workbook(self, timestamp, date_str):
         """Send the previously processed workbook."""
-        if not self.processed_workbook_path or not os.path.exists(self.processed_workbook_path):
+        if not self.data or not os.path.exists(self.data):
             LOGGER.error("No processed workbook available to send")
             self.report = "error: no processed workbook"
             return
             
         try:
-            await self.send_workbook(self.processed_workbook_path, timestamp)
+            await self.send_workbook(self.data, timestamp)
             self.last_sent_date = date_str
             self.last_sent_time = str(timestamp)
             self.report = "sent"
@@ -373,7 +373,7 @@ class EmailWorkbooks(Sensor, EasyResource):
             "next_send_time": str(next_send),
             "report": self.report,
             "workbook": self.workbook,
-            "processed_workbook": self.processed_workbook_path or "none",
+            "data": self.data or "none",
             "pid": os.getpid(),
             "location": self.location
         }
