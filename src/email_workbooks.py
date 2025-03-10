@@ -233,7 +233,7 @@ class EmailWorkbooks(Sensor, EasyResource):
 
         try:
             LOGGER.info(f"Processing workbook using template {master_template}")
-            data_path = self.processor.process(master_template)
+            workbook_path = self.processor.process(master_template)
             self.data = workbook_path
             self.last_processed_date = date_str
             self.last_processed_time = str(timestamp)
