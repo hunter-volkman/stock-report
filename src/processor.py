@@ -106,7 +106,7 @@ class WorkbookProcessor:
             "--start", start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "--end", end_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "--timezone", self.timezone,
-            "--bucketPeriod", "PT1M",
+            "--bucketPeriod", "PT5M",
             "--bucketMethod", "max",
             "--includeKeys", ".*_raw",
             "--output", output_file,
