@@ -74,7 +74,7 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.last_sent_time = None
         self.processed_workbook_path = None
         self.report = "not_sent"
-        self.process_status = "not_processed"
+        self.workbook = "not_processed"
         self.loop_task = None
         self.state_file = os.path.join(self.save_dir, "state.json")
         self.lock_file = os.path.join(self.save_dir, "lockfile")
@@ -228,7 +228,7 @@ class EmailWorkbooks(Sensor, EasyResource):
         
         if not os.path.exists(master_template):
             LOGGER.error(f"Master template {master_template} not found")
-            self.process_status = "error: missing template"
+            self.workbook = "error: missing template"
             return
 
         try:
@@ -237,12 +237,12 @@ class EmailWorkbooks(Sensor, EasyResource):
             self.processed_workbook_path = workbook_path
             self.last_processed_date = date_str
             self.last_processed_time = str(timestamp)
-            self.process_status = "processed"
+            self.workbook = "processed"
             self._save_state()
             LOGGER.info(f"Successfully processed workbook for {date_str}, saved at {workbook_path}")
             return workbook_path
         except Exception as e:
-            self.process_status = f"error: {str(e)}"
+            self.workbook = f"error: {str(e)}"
             LOGGER.error(f"Failed to process workbook for {date_str}: {e}")
             return None
 
@@ -372,7 +372,7 @@ class EmailWorkbooks(Sensor, EasyResource):
             "next_send_date": next_send.strftime("%Y%m%d"),
             "next_send_time": str(next_send),
             "report": self.report,
-            "process_status": self.process_status,
+            "workbook": self.workbook,
             "processed_workbook": self.processed_workbook_path or "none",
             "pid": os.getpid(),
             "location": self.location
