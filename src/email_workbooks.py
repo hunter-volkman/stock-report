@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import datetime
+from datetime import timedelta
 import fasteners
 from viam.components.sensor import Sensor
 from viam.resource.easy_resource import EasyResource
@@ -81,17 +82,17 @@ class EmailWorkbooks(Sensor, EasyResource):
         LOGGER.info(f"Saved state to {self.state_file}")
 
     def reconfigure(self, config: ComponentConfig, dependencies: dict[ResourceName, "ResourceBase"]):
-        attrs = config.attributes.fields
-        self.save_dir = attrs.get("save_dir", "/home/hunter.volkman/workbooks").string_value or "/home/hunter.volkman/workbooks"
-        self.export_script = attrs.get("export_script", "/home/hunter.volkman/viam-python-data-export/vde.py").string_value or "/home/hunter.volkman/viam-python-data-export/vde.py"
-        self.email = attrs["email"].string_value
-        self.password = attrs["password"].string_value
-        self.recipients = attrs["recipients"].string_value.split(",")
-        self.send_time = attrs.get("send_time", "20:00").string_value
-        self.location = attrs["location"].string_value
-        self.api_key_id = attrs["api_key_id"].string_value
-        self.api_key = attrs["api_key"].string_value
-        self.org_id = attrs["org_id"].string_value
+        attributes = struct_to_dict(config.attributes)
+        self.save_dir = attributes.get("save_dir", "/home/hunter.volkman/workbooks")
+        self.export_script = attributes.get("export_script", "/home/hunter.volkman/viam-python-data-export/vde.py")
+        self.email = attributes["email"]
+        self.password = attributes["password"]
+        self.recipients = attributes["recipients"]
+        self.send_time = attributes.get("send_time", "20:00")
+        self.location = attributes.get("location", "")
+        self.api_key_id = attributes["api_key_id"]
+        self.api_key = attributes["api_key"]
+        self.org_id = attributes["org_id"]
 
         self.processor = WorkbookProcessor(self.save_dir, self.export_script, self.api_key_id, self.api_key, self.org_id)
         os.makedirs(self.save_dir, exist_ok=True)
