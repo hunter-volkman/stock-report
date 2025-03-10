@@ -240,19 +240,46 @@ class EmailWorkbooks(Sensor, EasyResource):
             LOGGER.info(f"Released lock, loop exiting (PID {os.getpid()})")
 
     async def process_workbook(self, timestamp, date_str):
-        """Process the workbook for the data from yesterday."""
-        yesterday = timestamp - timedelta(days=1)
-        yesterday_str = yesterday.strftime("%m%d%y")
-        master_template = os.path.join(self.save_dir, f"3895th_{yesterday_str}.xlsx")
+        """
+        Process the workbook for the data from the specified date.
+        
+        Args:
+            timestamp: Datetime object representing the processing time
+            date_str: String representing the date to process (YYYYMMDD)
+        """
+        # Parse the target date from date_str (this is the day we want data for)
+        try:
+            target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
+            # Add timezone info
+            target_date = target_date.replace(tzinfo=tz.gettz(self.timezone))
+            LOGGER.info(f"Processing data for target date: {target_date.strftime('%Y-%m-%d')}")
+        except Exception as e:
+            LOGGER.error(f"Failed to parse date from {date_str}: {e}")
+            self.workbook = f"error: invalid date format {date_str}"
+            return None
+            
+        # Find the previous day's master template to use as a base
+        prev_day = target_date - timedelta(days=1)
+        prev_day_str = prev_day.strftime("%m%d%y")
+        master_template = os.path.join(self.save_dir, f"3895th_{prev_day_str}.xlsx")
         
         if not os.path.exists(master_template):
             LOGGER.error(f"Master template {master_template} not found")
             self.workbook = "error: missing template"
-            return
+            return None
 
         try:
-            LOGGER.info(f"Processing workbook using template {master_template}")
-            workbook_path = self.processor.process(master_template)
+            LOGGER.info(f"Processing workbook using template {master_template} for date {target_date.strftime('%Y-%m-%d')}")
+            
+            # Generate a raw export file with data for the target_date
+            raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
+            
+            # Pass the target_date to run_vde_export to get data for the specific date
+            self.processor.run_vde_export(raw_file, target_date)
+            
+            # Create new workbook from the template
+            workbook_path = self.processor.update_master_workbook(raw_file, master_template, target_date)
+            
             self.data = workbook_path
             self.last_processed_date = date_str
             self.last_processed_time = str(timestamp)
