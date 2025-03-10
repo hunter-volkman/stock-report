@@ -235,23 +235,33 @@ class WorkbookProcessor:
         except Exception as e:
             LOGGER.error(f"Error during LibreOffice recalculation: {e}")
 
-    def update_master_workbook(self, raw_file, master_template):
-        """Copy data from raw export to master workbook and update formulas."""
-        # Determine dates based on the template filename
-        template_date = self._extract_date_from_filename(master_template)
-        if template_date:
-            # The new file should be for the day after the template date
-            target_date = template_date + timedelta(days=1)
-            today_str = target_date.strftime("%m%d%y")
-            LOGGER.info(f"Using date from template: {template_date.strftime('%Y-%m-%d')} → {target_date.strftime('%Y-%m-%d')}")
-        else:
-            # Fall back to current date if we can't extract from filename
-            today_str = datetime.now(tz.gettz(self.timezone)).strftime("%m%d%y")
-            LOGGER.warning(f"Could not extract date from template filename, using current date: {today_str}")
+    def update_master_workbook(self, raw_file, master_template, target_date=None):
+        """
+        Copy data from raw export to master workbook and update formulas.
         
-        new_master_file = os.path.join(self.work_dir, f"3895th_{today_str}.xlsx")
+        Args:
+            raw_file: Path to the raw data export file
+            master_template: Path to the master template to use as a base
+            target_date: Date for the target workbook (if None, extract from template)
+        """
+        # Determine the target date for the new workbook
+        if target_date is None:
+            # Extract date from the template filename
+            template_date = self._extract_date_from_filename(master_template)
+            if template_date:
+                # The new file should be for the day after the template date
+                target_date = template_date + timedelta(days=1)
+                LOGGER.info(f"Using date from template: {template_date.strftime('%Y-%m-%d')} → {target_date.strftime('%Y-%m-%d')}")
+            else:
+                # Fall back to current date if we can't extract
+                target_date = datetime.now(tz.gettz(self.timezone))
+                LOGGER.warning(f"Could not extract date from template filename, using current date: {target_date.strftime('%Y-%m-%d')}")
+        
+        # Format the date string for the filename
+        target_str = target_date.strftime("%m%d%y")
+        new_master_file = os.path.join(self.work_dir, f"3895th_{target_str}.xlsx")
 
-        LOGGER.info(f"Creating new master workbook: {new_master_file}")
+        LOGGER.info(f"Creating new master workbook: {new_master_file} for {target_date.strftime('%Y-%m-%d')}")
         shutil.copy(master_template, new_master_file)
         
         try:
@@ -308,17 +318,36 @@ class WorkbookProcessor:
                     pass
             raise
 
-    def process(self, master_template):
-        """Main processing function: run export, update master workbook."""
+    def process(self, master_template, target_date=None):
+        """
+        Main processing function: run export, update master workbook.
+        
+        Args:
+            master_template: Path to the master template to use
+            target_date: Specific date to process (if None, use date from template)
+        """
         os.makedirs(self.work_dir, exist_ok=True)
         LOGGER.info(f"Starting workbook processing with template {master_template}")
         
-        # Extract date from master template for historical processing
-        template_date = self._extract_date_from_filename(master_template)
+        # Determine the date to process
+        if target_date is None:
+            # If no target date provided, extract from master template
+            template_date = self._extract_date_from_filename(master_template)
+            if template_date:
+                # Use the day after the template date as the target date
+                target_date = template_date + timedelta(days=1)
+                LOGGER.info(f"Using date from template filename: processing data for {target_date.strftime('%Y-%m-%d')}")
+            else:
+                # Default to yesterday if we can't extract from filename
+                target_date = self.get_yesterday_date()
+                LOGGER.warning(f"Could not extract date from template, defaulting to yesterday: {target_date.strftime('%Y-%m-%d')}")
+        else:
+            LOGGER.info(f"Using provided target date: {target_date.strftime('%Y-%m-%d')}")
         
         raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
         
-        # Pass the template date to run_vde_export to use the correct date for data
-        self.run_vde_export(raw_file, template_date)
+        # Pass the target date to run_vde_export to use the correct date for data
+        self.run_vde_export(raw_file, target_date)
         
-        return self.update_master_workbook(raw_file, master_template)
+        # Pass both the master template and target date to update_master_workbook
+        return self.update_master_workbook(raw_file, master_template, target_date)
