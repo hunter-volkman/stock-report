@@ -31,16 +31,16 @@ class EmailWorkbooks(Sensor, EasyResource):
 
     @classmethod
     def validate_config(cls, config: ComponentConfig) -> list[str]:
-        attrs = config.attributes.fields
+        attributes = struct_to_dict(config.attributes)
         required = ["email", "password", "recipients", "location", "api_key_id", "api_key", "org_id"]
         for attr in required:
-            if attr not in attrs or not attrs[attr].string_value:
-                raise ValueError(f"{attr} is required")
-        send_time = attrs.get("send_time", "20:00").string_value
+            if attr not in attributes:
+                raise Exception(f"{attr} is required")
+        send_time = attributes.get("send_time", "20:00")
         try:
-            datetime.datetime.strptime(send_time, "%H:%M")
+            datetime.datetime.strptime(str(send_time), "%H:%M")
         except ValueError:
-            raise ValueError(f"Invalid send_time '{send_time}': must be in 'HH:MM' format")
+            raise Exception(f"Invalid send_time '{send_time}': must be in 'HH:MM' format")
         return []
 
     def __init__(self, config: ComponentConfig):
@@ -63,16 +63,21 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.state_file = os.path.join(self.save_dir, "state.json")
         self.lock_file = os.path.join(self.save_dir, "lockfile")
         self._load_state()
+        LOGGER.info(f"Initialized EmailWorkbooks with name: {self.name}, save_dir: {self.save_dir}, PID: {os.getpid()}")
 
     def _load_state(self):
+        """Load persistent state from file."""
         if os.path.exists(self.state_file):
             with open(self.state_file, "r") as f:
                 state = json.load(f)
                 self.last_processed_date = state.get("last_processed_date")
                 self.last_sent_time = state.get("last_sent_time")
             LOGGER.info(f"Loaded state: last_processed_date={self.last_processed_date}, last_sent_time={self.last_sent_time}")
+        else:
+            LOGGER.info(f"No state file at {self.state_file}, starting fresh")
 
     def _save_state(self):
+        """Save state to file for persistence across restarts."""
         state = {
             "last_processed_date": self.last_processed_date,
             "last_sent_time": self.last_sent_time
@@ -82,12 +87,24 @@ class EmailWorkbooks(Sensor, EasyResource):
         LOGGER.info(f"Saved state to {self.state_file}")
 
     def reconfigure(self, config: ComponentConfig, dependencies: dict[ResourceName, "ResourceBase"]):
+        """Configure the module and start the scheduled loop."""
         attributes = struct_to_dict(config.attributes)
         self.save_dir = attributes.get("save_dir", "/home/hunter.volkman/workbooks")
         self.export_script = attributes.get("export_script", "/home/hunter.volkman/viam-python-data-export/vde.py")
         self.email = attributes["email"]
         self.password = attributes["password"]
-        self.recipients = attributes["recipients"]
+        
+        # Handle recipients properly (could be a string or a list)
+        recipients = attributes["recipients"]
+        if isinstance(recipients, list):
+            self.recipients = recipients
+        elif isinstance(recipients, str):
+            # Split by comma if it's a string
+            self.recipients = [r.strip() for r in recipients.split(",")]
+        else:
+            LOGGER.warning(f"Unexpected recipients format: {type(recipients)}, using as is")
+            self.recipients = [str(recipients)]
+            
         self.send_time = attributes.get("send_time", "20:00")
         self.location = attributes.get("location", "")
         self.api_key_id = attributes["api_key_id"]
@@ -96,11 +113,15 @@ class EmailWorkbooks(Sensor, EasyResource):
 
         self.processor = WorkbookProcessor(self.save_dir, self.export_script, self.api_key_id, self.api_key, self.org_id)
         os.makedirs(self.save_dir, exist_ok=True)
+        
+        LOGGER.info(f"Reconfigured {self.name} with save_dir: {self.save_dir}, recipients: {self.recipients}, location: {self.location}")
+        
         if self.loop_task:
             self.loop_task.cancel()
         self.loop_task = asyncio.create_task(self.run_scheduled_loop())
 
     def _get_next_send_time(self, now: datetime.datetime) -> datetime.datetime:
+        """Calculate the next send time based on current time and send_time."""
         today = now.date()
         send_time_dt = datetime.datetime.combine(today, datetime.datetime.strptime(self.send_time, "%H:%M").time())
         if now > send_time_dt:
@@ -108,6 +129,7 @@ class EmailWorkbooks(Sensor, EasyResource):
         return send_time_dt
 
     async def run_scheduled_loop(self):
+        """Run a scheduled loop that wakes up for the configured send_time."""
         lock = fasteners.InterProcessLock(self.lock_file)
         if not lock.acquire(blocking=False):
             LOGGER.info(f"Another instance running (PID {os.getpid()}), exiting")
@@ -134,9 +156,12 @@ class EmailWorkbooks(Sensor, EasyResource):
             LOGGER.error(f"Scheduled loop failed: {e}")
         finally:
             lock.release()
+            LOGGER.info(f"Released lock, loop exiting (PID {os.getpid()})")
 
     async def process_and_send(self, timestamp, date_str):
-        master_template = os.path.join(self.save_dir, f"3895th_{(timestamp - timedelta(days=1)).strftime('%m%d%y')}.xlsx")
+        """Process yesterday's data and send the daily workbook."""
+        yesterday = timestamp - timedelta(days=1)
+        master_template = os.path.join(self.save_dir, f"3895th_{yesterday.strftime('%m%d%y')}.xlsx")
         if not os.path.exists(master_template):
             LOGGER.error(f"Master template {master_template} not found")
             self.report = "error: missing template"
@@ -155,6 +180,7 @@ class EmailWorkbooks(Sensor, EasyResource):
             LOGGER.error(f"Failed to process/send for {date_str}: {e}")
 
     async def send_workbook(self, workbook_path, timestamp):
+        """Send the daily workbook report via email."""
         msg = MIMEMultipart()
         msg["From"] = self.email
         msg["To"] = ", ".join(self.recipients)
@@ -178,12 +204,13 @@ class EmailWorkbooks(Sensor, EasyResource):
                 smtp.starttls()
                 smtp.login(self.email, self.password)
                 smtp.send_message(msg)
-            LOGGER.info(f"Sent workbook to {msg['To']}")
+            LOGGER.info(f"Sent workbook to {', '.join(self.recipients)}")
         except Exception as e:
             LOGGER.error(f"Failed to send email: {e}")
             raise
 
     async def do_command(self, command: dict, *, timeout: float = None, **kwargs) -> dict:
+        """Handle manual command execution."""
         if command.get("command") == "process_and_send":
             day = command.get("day", datetime.datetime.now().strftime("%Y%m%d"))
             try:
@@ -197,6 +224,7 @@ class EmailWorkbooks(Sensor, EasyResource):
         return {"status": "Unknown command"}
 
     async def get_readings(self, *, extra: dict = None, timeout: float = None, **kwargs) -> dict[str, SensorReading]:
+        """Return the current state of the sensor for monitoring."""
         now = datetime.datetime.now()
         next_send = self._get_next_send_time(now)
         return {
