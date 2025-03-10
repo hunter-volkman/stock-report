@@ -44,8 +44,8 @@ class EmailWorkbooks(Sensor, EasyResource):
 
     def __init__(self, config: ComponentConfig):
         super().__init__(config.name)
-        self.work_dir = "/home/hunter.volkman/workbooks"
-        self.export_script = "/home/hunter.volkman/scripts/vde.py"
+        self.save_dir = "/home/hunter.volkman/workbooks"
+        self.export_script = "/home/hunter.volkman/viam-python-data-export/vde.py"
         self.email = ""
         self.password = ""
         self.recipients = []
@@ -59,8 +59,8 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.last_sent_time = None
         self.report = "not_sent"
         self.loop_task = None
-        self.state_file = os.path.join(self.work_dir, "state.json")
-        self.lock_file = os.path.join(self.work_dir, "lockfile")
+        self.state_file = os.path.join(self.save_dir, "state.json")
+        self.lock_file = os.path.join(self.save_dir, "lockfile")
         self._load_state()
 
     def _load_state(self):
@@ -82,7 +82,7 @@ class EmailWorkbooks(Sensor, EasyResource):
 
     def reconfigure(self, config: ComponentConfig, dependencies: dict[ResourceName, "ResourceBase"]):
         attrs = config.attributes.fields
-        self.work_dir = attrs.get("work_dir", "/home/hunter.volkman/workbooks").string_value or "/home/hunter.volkman/workbooks"
+        self.save_dir = attrs.get("save_dir", "/home/hunter.volkman/workbooks").string_value or "/home/hunter.volkman/workbooks"
         self.export_script = attrs.get("export_script", "/home/hunter.volkman/viam-python-data-export/vde.py").string_value or "/home/hunter.volkman/viam-python-data-export/vde.py"
         self.email = attrs["email"].string_value
         self.password = attrs["password"].string_value
@@ -93,8 +93,8 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.api_key = attrs["api_key"].string_value
         self.org_id = attrs["org_id"].string_value
 
-        self.processor = WorkbookProcessor(self.work_dir, self.export_script, self.api_key_id, self.api_key, self.org_id)
-        os.makedirs(self.work_dir, exist_ok=True)
+        self.processor = WorkbookProcessor(self.save_dir, self.export_script, self.api_key_id, self.api_key, self.org_id)
+        os.makedirs(self.save_dir, exist_ok=True)
         if self.loop_task:
             self.loop_task.cancel()
         self.loop_task = asyncio.create_task(self.run_scheduled_loop())
@@ -135,7 +135,7 @@ class EmailWorkbooks(Sensor, EasyResource):
             lock.release()
 
     async def process_and_send(self, timestamp, date_str):
-        master_template = os.path.join(self.work_dir, f"3895th_{(timestamp - timedelta(days=1)).strftime('%m%d%y')}.xlsx")
+        master_template = os.path.join(self.save_dir, f"3895th_{(timestamp - timedelta(days=1)).strftime('%m%d%y')}.xlsx")
         if not os.path.exists(master_template):
             LOGGER.error(f"Master template {master_template} not found")
             self.report = "error: missing template"
