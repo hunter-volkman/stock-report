@@ -2,6 +2,7 @@ import subprocess
 import os
 import shutil
 import tempfile
+import re
 from datetime import datetime, timedelta
 from dateutil import tz
 import openpyxl
@@ -56,7 +57,6 @@ class WorkbookProcessor:
         except Exception as e:
             LOGGER.error(f"Failed to set up viam-python-data-export virtual environment: {e}")
 
-
     def _check_libreoffice(self):
         """Check if LibreOffice is available on the system."""
         try:
@@ -70,22 +70,49 @@ class WorkbookProcessor:
         except Exception:
             return False
 
+    def _extract_date_from_filename(self, filename):
+        """Extract date from template filename like 3895th_MMDDYY.xlsx."""
+        try:
+            # Extract MMDDYY portion from the filename
+            match = re.search(r'3895th_(\d{6})\.xlsx', os.path.basename(filename))
+            if match:
+                date_str = match.group(1)
+                # Parse as month, day, year
+                month = int(date_str[0:2])
+                day = int(date_str[2:4])
+                # Convert 2-digit year to 4-digit year
+                year = int(date_str[4:6])
+                # Assume 20xx for the century (valid until 2099)
+                year += 2000
+                
+                # Create date object
+                return datetime(year, month, day, tzinfo=tz.gettz(self.timezone))
+            else:
+                LOGGER.warning(f"Could not extract date from filename: {filename}")
+                return None
+        except Exception as e:
+            LOGGER.error(f"Error parsing date from filename {filename}: {e}")
+            return None
+
     def get_yesterday_date(self):
         """Get yesterday's date in the configured timezone."""
         now = datetime.now(tz.gettz(self.timezone))
         return now - timedelta(days=1)
 
-    def run_vde_export(self, output_file):
-        """Run the vde.py script to export raw data for yesterday."""
-        yesterday = self.get_yesterday_date()
+    def run_vde_export(self, output_file, target_date=None):
+        """Run the vde.py script to export raw data for the specified date or yesterday."""
+        # Use the provided date or default to yesterday
+        if target_date is None:
+            target_date = self.get_yesterday_date()
+            LOGGER.info(f"No target date provided, using yesterday: {target_date.strftime('%Y-%m-%d')}")
         
         # Parse the time strings into hours and minutes
         start_hour, start_minute = map(int, self.export_start_time.split(':'))
         end_hour, end_minute = map(int, self.export_end_time.split(':'))
         
         # Create the datetime objects for start and end times
-        start_time = yesterday.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
-        end_time = yesterday.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+        start_time = target_date.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+        end_time = target_date.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
 
         LOGGER.info(f"Exporting data from {start_time} to {end_time} ({self.export_start_time} to {self.export_end_time})")
 
@@ -128,7 +155,7 @@ class WorkbookProcessor:
 
         try:
             # Run in the script's directory to handle relative paths
-             # Log the masked command
+            # Log the masked command
             LOGGER.info(f"Running vde.py command: {' '.join(cmd_mask)}")
             process = subprocess.run(
                 cmd, 
@@ -196,11 +223,11 @@ class WorkbookProcessor:
                 if result.returncode != 0:
                     LOGGER.warning(f"LibreOffice recalculation warning: {result.stderr}")
                 
-                # Get the converted file name
-                converted_file = os.path.join(temp_dir, filename)
+                # Get the converted file name - LibreOffice might change the extension
+                converted_files = [f for f in os.listdir(temp_dir) if f.startswith(os.path.splitext(filename)[0])]
                 
-                # If the conversion was successful, copy back the recalculated file
-                if os.path.exists(converted_file):
+                if converted_files:
+                    converted_file = os.path.join(temp_dir, converted_files[0])
                     shutil.copy(converted_file, excel_file)
                     LOGGER.info(f"Recalculated file saved back to {excel_file}")
                 else:
@@ -210,17 +237,27 @@ class WorkbookProcessor:
 
     def update_master_workbook(self, raw_file, master_template):
         """Copy data from raw export to master workbook and update formulas."""
-        yesterday = self.get_yesterday_date()
-        today_str = datetime.now(tz.gettz(self.timezone)).strftime("%m%d%y")
+        # Determine dates based on the template filename
+        template_date = self._extract_date_from_filename(master_template)
+        if template_date:
+            # The new file should be for the day after the template date
+            target_date = template_date + timedelta(days=1)
+            today_str = target_date.strftime("%m%d%y")
+            LOGGER.info(f"Using date from template: {template_date.strftime('%Y-%m-%d')} → {target_date.strftime('%Y-%m-%d')}")
+        else:
+            # Fall back to current date if we can't extract from filename
+            today_str = datetime.now(tz.gettz(self.timezone)).strftime("%m%d%y")
+            LOGGER.warning(f"Could not extract date from template filename, using current date: {today_str}")
+        
         new_master_file = os.path.join(self.work_dir, f"3895th_{today_str}.xlsx")
 
         LOGGER.info(f"Creating new master workbook: {new_master_file}")
         shutil.copy(master_template, new_master_file)
         
         try:
-            # Use openpyxl for data transfer
+            # Use openpyxl for data transfer with keep_vba=True to preserve charts and macros
             raw_wb = openpyxl.load_workbook(raw_file)
-            master_wb = openpyxl.load_workbook(new_master_file, data_only=False)  # Keep formulas
+            master_wb = openpyxl.load_workbook(new_master_file, data_only=False, keep_vba=True)
 
             # Check if RAW sheet exists in raw workbook
             if "RAW" not in raw_wb.sheetnames:
@@ -276,6 +313,12 @@ class WorkbookProcessor:
         os.makedirs(self.work_dir, exist_ok=True)
         LOGGER.info(f"Starting workbook processing with template {master_template}")
         
+        # Extract date from master template for historical processing
+        template_date = self._extract_date_from_filename(master_template)
+        
         raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
-        self.run_vde_export(raw_file)
+        
+        # Pass the template date to run_vde_export to use the correct date for data
+        self.run_vde_export(raw_file, template_date)
+        
         return self.update_master_workbook(raw_file, master_template)
