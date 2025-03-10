@@ -11,13 +11,16 @@ from viam.logging import getLogger
 LOGGER = getLogger(__name__)
 
 class WorkbookProcessor:
-    def __init__(self, work_dir, export_script, api_key_id, api_key, org_id, timezone="America/New_York"):
+    def __init__(self, work_dir, export_script, api_key_id, api_key, org_id, 
+                 timezone="America/New_York", export_start_time="7:00", export_end_time="19:00"):
         self.work_dir = work_dir
         self.export_script = export_script
         self.api_key_id = api_key_id
         self.api_key = api_key
         self.org_id = org_id
         self.timezone = timezone
+        self.export_start_time = export_start_time
+        self.export_end_time = export_en
         # Check if LibreOffice is available for formula recalculation
         self.libreoffice_available = self._check_libreoffice()
         if self.libreoffice_available:
@@ -46,10 +49,16 @@ class WorkbookProcessor:
     def run_vde_export(self, output_file):
         """Run the vde.py script to export raw data for yesterday."""
         yesterday = self.get_yesterday_date()
-        start_time = yesterday.replace(hour=7, minute=0, second=0, microsecond=0)
-        end_time = yesterday.replace(hour=19, minute=0, second=0, microsecond=0)
+        
+        # Parse the time strings into hours and minutes
+        start_hour, start_minute = map(int, self.export_start_time.split(':'))
+        end_hour, end_minute = map(int, self.export_end_time.split(':'))
+        
+        # Create the datetime objects for start and end times
+        start_time = yesterday.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+        end_time = yesterday.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
 
-        LOGGER.info(f"Exporting data from {start_time} to {end_time}")
+        LOGGER.info(f"Exporting data from {start_time} to {end_time} ({self.export_start_time} to {self.export_end_time})")
         
         cmd = [
             "python3", self.export_script, "-vv", "excel",
@@ -69,6 +78,7 @@ class WorkbookProcessor:
 
         try:
             # Run in the script's directory to handle relative paths
+            LOGGER.info(f"Running vde.py command: {' '.join(cmd)}")
             process = subprocess.run(
                 cmd, 
                 check=True, 
@@ -76,7 +86,24 @@ class WorkbookProcessor:
                 capture_output=True,
                 text=True
             )
-            LOGGER.info(f"vde.py output: {process.stdout.strip()}")
+            
+            # Log important parts of the output, but not everything to avoid spamming logs
+            stdout_lines = process.stdout.strip().split('\n')
+            if stdout_lines:
+                # Log first 5 lines and last 5 lines if there's a lot of output
+                if len(stdout_lines) > 10:
+                    LOGGER.info("vde.py output first lines:")
+                    for line in stdout_lines[:5]:
+                        LOGGER.info(f"  {line}")
+                    LOGGER.info("...")
+                    LOGGER.info("vde.py output last lines:")
+                    for line in stdout_lines[-5:]:
+                        LOGGER.info(f"  {line}")
+                else:
+                    # Just log all if it's not too much
+                    LOGGER.info("vde.py output:")
+                    for line in stdout_lines:
+                        LOGGER.info(f"  {line}")
             
             if not os.path.exists(output_file):
                 raise FileNotFoundError("vde.py ran but raw_export.xlsx was not created.")
@@ -86,7 +113,10 @@ class WorkbookProcessor:
         except subprocess.CalledProcessError as e:
             LOGGER.error(f"Failed to run vde.py: {e}")
             if e.stderr:
-                LOGGER.error(f"Error output: {e.stderr}")
+                stderr_lines = e.stderr.strip().split('\n')
+                LOGGER.error("vde.py stderr output:")
+                for line in stderr_lines:
+                    LOGGER.error(f"  {line}")
             raise RuntimeError(f"vde.py export failed: {e}")
 
     def _recalculate_with_libreoffice(self, excel_file):

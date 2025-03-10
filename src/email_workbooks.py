@@ -143,11 +143,30 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.api_key = attributes["api_key"]
         self.org_id = attributes["org_id"]
 
+        # Get export time settings
+        self.export_start_time = attributes.get("export_start_time", "7:00")
+        self.export_end_time = attributes.get("export_end_time", "19:00")
+        self.timezone = attributes.get("timezone", "America/New_York")
+
         self.processor = WorkbookProcessor(self.save_dir, self.export_script, self.api_key_id, self.api_key, self.org_id)
+
+        self.processor = WorkbookProcessor(
+            self.save_dir, 
+            self.export_script, 
+            self.api_key_id, 
+            self.api_key, 
+            self.org_id,
+            timezone=self.timezone,
+            export_start_time=self.export_start_time,
+            export_end_time=self.export_end_time
+        )
+
         os.makedirs(self.save_dir, exist_ok=True)
         
         LOGGER.info(f"Reconfigured {self.name} with save_dir: {self.save_dir}, recipients: {self.recipients}, "
                    f"location: {self.location}, process_time: {self.process_time}, send_time: {self.send_time}")
+        
+        # Add metadata to this part
         
         if self.loop_task:
             self.loop_task.cancel()
