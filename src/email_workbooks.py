@@ -9,7 +9,7 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import ResourceName
-from viam.utils import SensorReading
+from viam.utils import SensorReading, struct_to_dict
 from viam.logging import getLogger
 import smtplib
 from email.mime.multipart import MIMEMultipart
