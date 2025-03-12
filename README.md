@@ -1,6 +1,6 @@
 # Module workbook-emailer 
 
-This module enables a Raspberry Pi to autonomously fetch sensor data, process Excel workbooks, and email daily reports with updated data. It connects to a Viam machine's data export API to retrieve langer fill level data, updates a master workbook with new data, and emails the results. The module persists its state to resume after power cycles or restarts.
+This module enables a Raspberry Pi to autonomously generate daily Excel workbook reports from sensor data, process them using a master template, and email them to specified recipients. It integrates with Viam’s data export tool (`vde.py`), persists its state for reliability across restarts, and operates independently of the Viam app’s CONTROL tab. Twice-daily `viam-agent` restarts (6:00 AM and 6:00 PM EST) ensure stability despite updates or connection issues.
 
 ## Model `hunter:sensor:workbook-emailer`
 
