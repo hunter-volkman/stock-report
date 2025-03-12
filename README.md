@@ -13,13 +13,16 @@ Configure the model using the following JSON template in your Viam robot configu
 {
   "email": "<string>",
   "password": "<string>",
-  "recipients": "<string or array of strings>",
+  "recipients": ["<string>", "<string>"],
   "location": "<string>",
   "api_key_id": "<string>",
   "api_key": "<string>",
   "org_id": "<string>",
-  "process_time": "<string>",
   "send_time": "<string>",
+  "process_time": "<string>",
+  "export_start_time": "<string>",
+  "export_end_time": "<string>",
+  "timezone": "<string>",
   "save_dir": "<string>",
   "export_script": "<string>"
 }
@@ -31,8 +34,17 @@ The following attributes are available for this model:
 
 | Name          | Type   | Inclusion | Description                |
 |---------------|--------|-----------|----------------------------|
-| `email` | string  | Required  | GMail address for sending emails. |
-| `password` | string | Required  | Description of attribute 2 |
+| `email` | string | Required | Gmail address for sending emails. |
+| `password` | string | Required | Gmail App Password for authentication (generate via Google Account settings). |
+| `recipients` | list of string | Required | Email addresses to receive the daily report. |
+| `location` | string | Required | Location identifier for the email subject and body. |
+| `api_key` | string | Required | Viam API key for data export via `vde.py`. |
+| `api_key_id` | string | Required | Viam API key ID for data export via `vde.py`. |
+| `org_id` | string | Required | Viam organization ID for data export via `vde.py`. |
+| `send_time` | string | Optional | Viam organization ID for data export via `vde.py`. |
+
+
+
 
 #### Example Configuration
 
