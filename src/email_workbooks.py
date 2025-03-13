@@ -79,9 +79,9 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.org_id = ""
         self.timezone = "America/New_York"  # Added for consistent timezone handling
         self.export_start_time_weekday = "7:00"  # Weekday store opens 7:00 AM EST
-        self.export_end_time_weekday = "19:00"  # Weekday store closes 7:00 PM EST
+        self.export_end_time_weekday = "19:05"  # Weekday store closes 7:00 PM EST
         self.export_start_time_weekend = "8:00"  # Weekend store opens 8:00 AM EST
-        self.export_end_time_weekend = "16:00"  # Weekend store closes 4:00 PM EST
+        self.export_end_time_weekend = "16:05"  # Weekend store closes 4:00 PM EST
         self.processor = None
         self.last_processed_date = None
         self.last_processed_time = None
