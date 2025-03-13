@@ -13,7 +13,9 @@ LOGGER = getLogger(__name__)
 
 class WorkbookProcessor:
     def __init__(self, work_dir, export_script, api_key_id, api_key, org_id, 
-                 timezone="America/New_York", export_start_time="7:00", export_end_time="19:00"):
+                 timezone="America/New_York", export_start_time_weekday="7:00", 
+                 export_end_time_weekday="19:00", export_start_time_weekend="8:00", 
+                 export_end_time_weekend="16:00"):
         self.work_dir = work_dir
         self.export_script_path = export_script
         self.export_script_dir = os.path.dirname(export_script)
@@ -21,8 +23,10 @@ class WorkbookProcessor:
         self.api_key = api_key
         self.org_id = org_id
         self.timezone = timezone
-        self.export_start_time = export_start_time
-        self.export_end_time = export_end_time
+        self.export_start_time_weekday = export_start_time_weekday
+        self.export_end_time_weekday = export_end_time_weekday
+        self.export_start_time_weekend = export_start_time_weekend
+        self.export_end_time_weekend = export_end_time_weekend
         # Check if LibreOffice is available for formula recalculation
         self.libreoffice_available = self._check_libreoffice()
         if self.libreoffice_available:
@@ -99,6 +103,13 @@ class WorkbookProcessor:
         now = datetime.now(tz.gettz(self.timezone))
         return now - timedelta(days=1)
 
+    def _get_export_times_for_day(self, target_date):
+        """Determine export start and end times based on whether it's a weekday or weekend."""
+        is_weekday = target_date.weekday() < 5  # Mon=0, Sun=6
+        start_time_str = self.export_start_time_weekday if is_weekday else self.export_start_time_weekend
+        end_time_str = self.export_end_time_weekday if is_weekday else self.export_end_time_weekend
+        return start_time_str, end_time_str
+
     def run_vde_export(self, output_file, target_date=None):
         """Run the vde.py script to export raw data for the specified date or yesterday."""
         # Use the provided date or default to yesterday
@@ -106,15 +117,18 @@ class WorkbookProcessor:
             target_date = self.get_yesterday_date()
             LOGGER.info(f"No target date provided, using yesterday: {target_date.strftime('%Y-%m-%d')}")
         
+        # Get the appropriate export times based on the day
+        start_time_str, end_time_str = self._get_export_times_for_day(target_date)
+        
         # Parse the time strings into hours and minutes
-        start_hour, start_minute = map(int, self.export_start_time.split(':'))
-        end_hour, end_minute = map(int, self.export_end_time.split(':'))
+        start_hour, start_minute = map(int, start_time_str.split(':'))
+        end_hour, end_minute = map(int, end_time_str.split(':'))
         
         # Create the datetime objects for start and end times
         start_time = target_date.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
         end_time = target_date.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
 
-        LOGGER.info(f"Exporting data from {start_time} to {end_time} ({self.export_start_time} to {self.export_end_time})")
+        LOGGER.info(f"Exporting data from {start_time} to {end_time} ({start_time_str} to {end_time_str})")
 
         # Construct the shell script to run vde.py with its virtual environment
         venv_python = os.path.join(self.venv_path, "bin", "python")
@@ -242,7 +256,7 @@ class WorkbookProcessor:
         Args:
             raw_file: Path to the raw data export file
             master_template: Path to the master template to use as a base
-            target_date: Date for the target workbook (if None, extract from template)
+            target_date: Date for the target workbook (if None, extract from template or use current date)
         """
         # Determine the target date for the new workbook
         if target_date is None:
@@ -261,7 +275,15 @@ class WorkbookProcessor:
         target_str = target_date.strftime("%m%d%y")
         new_master_file = os.path.join(self.work_dir, f"3895th_{target_str}.xlsx")
 
-        LOGGER.info(f"Creating new master workbook: {new_master_file} for {target_date.strftime('%Y-%m-%d')}")
+        # Use weekday or weekend template based on the target date
+        template_name = "template_weekday.xlsx" if target_date.weekday() < 5 else "template_weekend.xlsx"
+        master_template = os.path.join(self.work_dir, template_name)
+        
+        if not os.path.exists(master_template):
+            LOGGER.error(f"Master template {master_template} not found")
+            raise FileNotFoundError(f"Master template {master_template} not found")
+
+        LOGGER.info(f"Creating new master workbook: {new_master_file} for {target_date.strftime('%Y-%m-%d')} using template {master_template}")
         shutil.copy(master_template, new_master_file)
         
         try:
@@ -318,36 +340,27 @@ class WorkbookProcessor:
                     pass
             raise
 
-    def process(self, master_template, target_date=None):
+    def process(self, target_date=None):
         """
         Main processing function: run export, update master workbook.
         
         Args:
-            master_template: Path to the master template to use
-            target_date: Specific date to process (if None, use date from template)
+            target_date: Specific date to process (if None, use yesterday)
         """
         os.makedirs(self.work_dir, exist_ok=True)
-        LOGGER.info(f"Starting workbook processing with template {master_template}")
+        LOGGER.info(f"Starting workbook processing for {target_date.strftime('%Y-%m-%d') if target_date else 'yesterday'}")
         
         # Determine the date to process
         if target_date is None:
-            # If no target date provided, extract from master template
-            template_date = self._extract_date_from_filename(master_template)
-            if template_date:
-                # Use the day after the template date as the target date
-                target_date = template_date + timedelta(days=1)
-                LOGGER.info(f"Using date from template filename: processing data for {target_date.strftime('%Y-%m-%d')}")
-            else:
-                # Default to yesterday if we can't extract from filename
-                target_date = self.get_yesterday_date()
-                LOGGER.warning(f"Could not extract date from template, defaulting to yesterday: {target_date.strftime('%Y-%m-%d')}")
+            target_date = self.get_yesterday_date()
+            LOGGER.info(f"No target date provided, processing data for yesterday: {target_date.strftime('%Y-%m-%d')}")
         else:
             LOGGER.info(f"Using provided target date: {target_date.strftime('%Y-%m-%d')}")
         
         raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
         
-        # Pass the target date to run_vde_export to use the correct date for data
+        # Pass the target date to run_vde_export to use the correct date and times
         self.run_vde_export(raw_file, target_date)
         
-        # Pass both the master template and target date to update_master_workbook
-        return self.update_master_workbook(raw_file, master_template, target_date)
+        # Use the target date to select the correct template
+        return self.update_master_workbook(raw_file, None, target_date)
