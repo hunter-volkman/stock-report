@@ -17,6 +17,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from .processor import WorkbookProcessor
+from dateutil import tz
 
 LOGGER = getLogger(__name__)
 
@@ -51,6 +52,15 @@ class EmailWorkbooks(Sensor, EasyResource):
                 datetime.datetime.strptime(str(process_time), "%H:%M")
             except ValueError:
                 raise Exception(f"Invalid process_time '{process_time}': must be in 'HH:MM' format")
+
+        # Validate new weekday/weekend export times
+        for time_attribute in ["export_start_time_weekday", "export_end_time_weekday",
+                         "export_start_time_weekend", "export_end_time_weekend"]:
+            if time_attribute in attributes:
+                try:
+                    datetime.datetime.strptime(attributes[time_attribute], "%H:%M")
+                except ValueError:
+                    raise Exception(f"Invalid {time_attribute} '{attributes[time_attribute]}': must be in 'HH:MM' format")
                 
         return []
 
@@ -67,6 +77,11 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.api_key_id = ""
         self.api_key = ""
         self.org_id = ""
+        self.timezone = "America/New_York"  # Added for consistent timezone handling
+        self.export_start_time_weekday = "7:00"  # Weekday store opens 7:00 AM EST
+        self.export_end_time_weekday = "19:00"  # Weekday store closes 7:00 PM EST
+        self.export_start_time_weekend = "8:00"  # Weekend store opens 8:00 AM EST
+        self.export_end_time_weekend = "16:00"  # Weekend store closes 4:00 PM EST
         self.processor = None
         self.last_processed_date = None
         self.last_processed_time = None
@@ -142,13 +157,11 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.api_key_id = attributes["api_key_id"]
         self.api_key = attributes["api_key"]
         self.org_id = attributes["org_id"]
-
-        # Get export time settings
-        self.export_start_time = attributes.get("export_start_time", "7:00")
-        self.export_end_time = attributes.get("export_end_time", "19:00")
         self.timezone = attributes.get("timezone", "America/New_York")
-
-        self.processor = WorkbookProcessor(self.save_dir, self.export_script, self.api_key_id, self.api_key, self.org_id)
+        self.export_start_time_weekday = attributes.get("export_start_time_weekday", "7:00")
+        self.export_end_time_weekday = attributes.get("export_end_time_weekday", "19:00")
+        self.export_start_time_weekend = attributes.get("export_start_time_weekend", "8:00")
+        self.export_end_time_weekend = attributes.get("export_end_time_weekend", "16:00")
 
         self.processor = WorkbookProcessor(
             self.save_dir, 
@@ -157,8 +170,10 @@ class EmailWorkbooks(Sensor, EasyResource):
             self.api_key, 
             self.org_id,
             timezone=self.timezone,
-            export_start_time=self.export_start_time,
-            export_end_time=self.export_end_time
+            export_start_time_weekday=self.export_start_time_weekday,
+            export_end_time_weekday=self.export_end_time_weekday,
+            export_start_time_weekend=self.export_start_time_weekend,
+            export_end_time_weekend=self.export_end_time_weekend
         )
 
         os.makedirs(self.save_dir, exist_ok=True)
@@ -166,7 +181,7 @@ class EmailWorkbooks(Sensor, EasyResource):
         LOGGER.info(f"Reconfigured {self.name} with save_dir: {self.save_dir}, recipients: {self.recipients}, "
                    f"location: {self.location}, process_time: {self.process_time}, send_time: {self.send_time}")
         
-        # Add metadata to this part
+        # Add metadata to this part (your comment preserved)
         
         if self.loop_task:
             self.loop_task.cancel()
@@ -258,10 +273,9 @@ class EmailWorkbooks(Sensor, EasyResource):
             self.workbook = f"error: invalid date format {date_str}"
             return None
             
-        # Find the previous day's master template to use as a base
-        prev_day = target_date - timedelta(days=1)
-        prev_day_str = prev_day.strftime("%m%d%y")
-        master_template = os.path.join(self.save_dir, f"3895th_{prev_day_str}.xlsx")
+        # Use weekday or weekend template based on the target date
+        template_name = "template_weekday.xlsx" if target_date.weekday() < 5 else "template_weekend.xlsx"
+        master_template = os.path.join(self.save_dir, template_name)
         
         if not os.path.exists(master_template):
             LOGGER.error(f"Master template {master_template} not found")
@@ -271,14 +285,8 @@ class EmailWorkbooks(Sensor, EasyResource):
         try:
             LOGGER.info(f"Processing workbook using template {master_template} for date {target_date.strftime('%Y-%m-%d')}")
             
-            # Generate a raw export file with data for the target_date
-            raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
-            
-            # Pass the target_date to run_vde_export to get data for the specific date
-            self.processor.run_vde_export(raw_file, target_date)
-            
-            # Create new workbook from the template
-            workbook_path = self.processor.update_master_workbook(raw_file, master_template, target_date)
+            # Delegate processing to the WorkbookProcessor
+            workbook_path = self.processor.process(target_date)
             
             self.data = workbook_path
             self.last_processed_date = date_str
@@ -312,15 +320,6 @@ class EmailWorkbooks(Sensor, EasyResource):
 
     async def process_and_send(self, timestamp, date_str):
         """Process yesterday's data and send the daily workbook immediately."""
-        yesterday = timestamp - timedelta(days=1)
-        yesterday_str = yesterday.strftime("%m%d%y") 
-        master_template = os.path.join(self.save_dir, f"3895th_{yesterday_str}.xlsx")
-        
-        if not os.path.exists(master_template):
-            LOGGER.error(f"Master template {master_template} not found")
-            self.report = "error: missing template"
-            return
-
         try:
             workbook_path = await self.process_workbook(timestamp, date_str)
             if workbook_path:
