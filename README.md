@@ -1,10 +1,10 @@
 # Module workbook-emailer 
 
-This module enables a Raspberry Pi to autonomously generate daily Excel workbook reports from sensor data, process them using a master template, and email them to specified recipients. It integrates with Viam’s data export tool (`vde.py`), persists its state for reliability across restarts, and operates independently of the Viam app’s CONTROL tab. Twice-daily `viam-agent` restarts (6:00 AM and 6:00 PM EST) ensure stability despite updates or connection issues.
+This module enables a Raspberry Pi to autonomously generate daily Excel workbook reports from sensor data, process them using weekday or weekend templates, and email them to specified recipients. It integrates with Viam’s data export tool (`vde.py`), adjusts export times based on store hours (weekdays: 7:00–19:00 EST, weekends: 8:00–16:00 EST), persists its state for reliability, and operates independently of the Viam app’s CONTROL tab. Twice-daily `viam-agent` restarts (6:00 AM and 6:00 PM EST) ensure stability.
 
 ## Model `hunter:sensor:workbook-emailer`
 
-A custom sensor component that processes Excel workbooks with data from the viam-python-data-export tool. It runs locally on a Raspberry Pi, connects to a store's Viam machine, and uses a scheduled loop with inter-process locking for reliability.
+A custom sensor component that fetches sensor data via `vde.py`, updates a master Excel template (weekday or weekend), and emails the daily report. It runs locally on a Raspberry Pi, connects to a Viam machine, and uses a scheduled loop with inter-process locking.
 
 ### Configuration
 Configure the model using the following JSON template in your Viam robot configuration:
@@ -20,8 +20,10 @@ Configure the model using the following JSON template in your Viam robot configu
   "org_id": "<string>",
   "send_time": "<string>",
   "process_time": "<string>",
-  "export_start_time": "<string>",
-  "export_end_time": "<string>",
+  "export_start_time_weekday": "<string>",
+  "export_end_time_weekday": "<string>",
+  "export_start_time_weekend": "<string>",
+  "export_end_time_weekend": "<string>",
   "timezone": "<string>",
   "save_dir": "<string>",
   "export_script": "<string>"
@@ -38,15 +40,20 @@ The following attributes are available for this model:
 | `password` | string | Required | Gmail App Password for authentication (generate via Google Account settings). |
 | `recipients` | list of string | Required | Email addresses to receive the daily report. |
 | `location` | string | Required | Location identifier for the email subject and body. |
-| `api_key` | string | Required | Viam API key for data export via `vde.py`. |
 | `api_key_id` | string | Required | Viam API key ID for data export via `vde.py`. |
+| `api_key` | string | Required | Viam API key for data export via `vde.py`. |
 | `org_id` | string | Required | Viam organization ID for data export via `vde.py`. |
 | `send_time` | string | Optional | Time in `timezone` (`"HH:MM"`) to send the report. Defaults to `"20:00"`. |
 | `process_time` | string | Optional | Time in `timezone` (`"HH:MM"`) to process the workbook. Defaults to 1 hour before `send_time`. |
-| `export_start_time` | string | Optional | Start time in `timezone` (`"HH:MM"`) for data export. Defaults to `"7:00"`. |
-| `export_end_time` | string | Optional | End time in `timezone` (`"HH:MM"`) for data export. Defaults to `"19:00"`. |
-| `timezone` | string | Optional | Timezone for scheduling. Defaults to `"America/New_York"`. |
-| `save_dir` | string | Optional | Directory to save workbooks. Defaults to `"/home/hunter.volkman/workbooks"`. |
+
+| `export_start_time_weekday` | string | Optional | Weekday start time in timezone ("HH:MM") for data export (e.g., "7:00"). Defaults to "7:00". |
+| `export_end_time_weekday` | string | Optional | Weekday end time in timezone ("HH:MM") for data export (e.g., "19:00"). Defaults to "19:00". |
+| `export_start_time_weekend` | string | Optional | Weekend start time in timezone ("HH:MM") for data export (e.g., "8:00"). Defaults to "8:00". |
+| `export_end_time_weekend` | string | Optional | Start time in `timezone` (`"HH:MM"`) for data export. Defaults to `"7:00"`. |
+
+
+| `timezone` | string | Optional | Timezone for scheduling (e.g., "America/New_York"). Defaults to "America/New_York". |
+| `save_dir` | string | Optional | Directory for workbooks and templates (e.g., "/home/user/workbooks"). Defaults to "/home/hunter.volkman/workbooks". |
 | `export_script` | string | Optional | Path to `vde.py`. Defaults to `"/home/hunter.volkman/viam-python-data-export/vde.py"`. |
 
 
@@ -54,20 +61,22 @@ The following attributes are available for this model:
 
 ```json
 {
-  "email": "user.name@example.com",
+  "email": "user@example.com",
   "password": "gmail-app-password",
-  "recipients": ["recipient1@example.com", "recipient2@example.com"],
+  "recipients": ["recipient1@example.com"],
   "location": "Test Location",
   "api_key_id": "<your-api-key-id>",
   "api_key": "<your-api-key>",
   "org_id": "<your-org-id>",
   "send_time": "22:00",
   "process_time": "21:00",
-  "export_start_time": "7:00",
-  "export_end_time": "19:00",
+  "export_start_time_weekday": "7:00",
+  "export_end_time_weekday": "19:00",
+  "export_start_time_weekend": "8:00",
+  "export_end_time_weekend": "16:00",
   "timezone": "America/New_York",
-  "save_dir": "/home/user.name/workbooks",
-  "export_script": "/home/user.name/viam-python-data-export/vde.py"
+  "save_dir": "/home/user/workbooks",
+  "export_script": "/home/user/viam-python-data-export/vde.py"
 }
 ```
 
@@ -143,13 +152,14 @@ Reconfigured sensor-2 with save_dir: /home/hunter.volkman/workbooks, recipients:
 
 During processing:
 ```text
-Processing workbook using template /home/hunter.volkman/workbooks/3895th_031025.xlsx for date 2025-03-11
-Successfully processed workbook for 20250311, saved at /home/hunter.volkman/workbooks/3895th_031125.xlsx
+Processing data for target date: 2025-03-12
+Exporting data from 2025-03-12 07:00:00-0500 to 2025-03-12 19:00:00-0500 (7:00 to 19:00)
+Successfully processed workbook for 20250312, saved at /home/hunter.volkman/workbooks/3895th_031225.xlsx
 ```
 
 During sending:
 ```text
-Sent processed workbook for 20250311
+Sent processed workbook for 20250312
 ```
 
 
