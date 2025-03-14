@@ -270,6 +270,7 @@ class WorkbookProcessor:
     def update_master_workbook(self, raw_file, master_template, target_date=None):
         """
         Copy data from raw export to master workbook and update formulas.
+        Enhanced version to preserve charts and VBA components.
         
         Args:
             raw_file: Path to the raw data export file
@@ -302,11 +303,17 @@ class WorkbookProcessor:
             raise FileNotFoundError(f"Master template {master_template} not found")
 
         LOGGER.info(f"Creating new master workbook: {new_master_file} for {target_date.strftime('%Y-%m-%d')} using template {master_template}")
-        shutil.copy(master_template, new_master_file)
+        
+        # Create a binary copy of the template to ensure all elements are preserved
+        with open(master_template, 'rb') as src, open(new_master_file, 'wb') as dst:
+            dst.write(src.read())
         
         try:
-            # Use openpyxl for data transfer with keep_vba=True to preserve charts and macros
-            raw_wb = openpyxl.load_workbook(raw_file)
+            # Load workbooks - make sure to use keep_vba=True to preserve macros and charts
+            LOGGER.info(f"Loading raw data from {raw_file}")
+            raw_wb = openpyxl.load_workbook(raw_file, data_only=True)  # Use data_only=True to get values
+
+            LOGGER.info(f"Loading master workbook from {new_master_file}")
             master_wb = openpyxl.load_workbook(new_master_file, data_only=False, keep_vba=True)
 
             # Check if RAW sheet exists in raw workbook
@@ -323,28 +330,45 @@ class WorkbookProcessor:
                 
             import_sheet = master_wb["Raw Import"]
 
-            # Clear existing data in the import sheet
-            LOGGER.info("Clearing existing data in Raw Import sheet")
-            for row in import_sheet.iter_rows():
+            # Clear existing data in the import sheet, but be careful not to clear headers
+            # Determine how many header rows to preserve based on your workbook structure
+            header_rows = 1  # Adjust if your sheet has more header rows
+            
+            LOGGER.info(f"Clearing existing data in Raw Import sheet (preserving {header_rows} header rows)")
+            for row_idx, row in enumerate(import_sheet.iter_rows(min_row=header_rows+1), start=header_rows+1):
                 for cell in row:
                     cell.value = None
 
-            # Copy data more efficiently using cell references
+            # Get header from raw sheet for column matching
+            raw_headers = [cell.value for cell in next(raw_sheet.rows)]
+            
+            # Copy data from RAW to Raw Import
             LOGGER.info("Copying data from RAW to Raw Import")
             row_count = 0
-            for row_idx, row in enumerate(raw_sheet.rows, start=1):
+            
+            # Start copying from the second row (after headers)
+            data_rows = list(raw_sheet.rows)
+            
+            for row_idx, row in enumerate(data_rows[1:], start=header_rows+1):
                 for col_idx, cell in enumerate(row, start=1):
                     import_sheet.cell(row=row_idx, column=col_idx).value = cell.value
                 row_count += 1
-
-            # Save the workbook with updated data
-            master_wb.save(new_master_file)
-            LOGGER.info(f"Copied {row_count} rows to Raw Import tab")
             
-            # Use LibreOffice for formula recalculation if available
+            # Log summary of copied data
+            LOGGER.info(f"Copied {row_count} rows from RAW to Raw Import tab")
+            
+            # Save the workbook with updated data
+            LOGGER.info(f"Saving updated workbook to {new_master_file}")
+            master_wb.save(new_master_file)
+            
+            # Ensure all references to master_wb are removed so file isn't locked
+            del master_wb
+            
+            # Use LibreOffice for formula recalculation to refresh charts
+            LOGGER.info("Running LibreOffice recalculation to update formulas and charts")
             self._recalculate_with_libreoffice(new_master_file)
             
-            LOGGER.info(f"Updated workbook saved at {new_master_file}")
+            LOGGER.info(f"Updated workbook successfully saved at {new_master_file}")
             return new_master_file
         except Exception as e:
             LOGGER.error(f"Error updating master workbook: {e}")
