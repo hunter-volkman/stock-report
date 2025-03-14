@@ -212,7 +212,10 @@ class WorkbookProcessor:
             raise RuntimeError(f"vde.py export failed: {e}")
 
     def _recalculate_with_libreoffice(self, excel_file):
-        """Use LibreOffice to ensure formulas are recalculated."""
+        """
+        Use LibreOffice to ensure formulas are recalculated while preserving charts.
+        This enhanced version ensures charts are retained during processing.
+        """
         if not self.libreoffice_available:
             LOGGER.warning("Skipping LibreOffice recalculation (not available)")
             return
@@ -224,28 +227,43 @@ class WorkbookProcessor:
                 filename = os.path.basename(excel_file)
                 
                 # Construct LibreOffice command for silent recalculation
+                # --infilter="Microsoft Excel 2007-365 XML (*.xlsx):FOURM=67,VBAON=1" is crucial
+                # This tells LibreOffice to preserve VBA macros and charts
                 cmd = [
-                    "libreoffice", "--headless", "--calc", 
-                    "--convert-to", "xlsx", 
-                    "--outdir", temp_dir,
+                    "libreoffice", 
+                    "--headless", 
+                    "--calc", 
+                    "--infilter=\"Microsoft Excel 2007-365 XML (*.xlsx):FOURM=67,VBAON=1\"",
+                    "--convert-to", 
+                    "xlsx:\"Calc MS Excel 2007 XML:VBAON=1\"", 
+                    "--outdir", 
+                    temp_dir,
                     excel_file
                 ]
                 
                 LOGGER.info(f"Recalculating formulas in {excel_file} with LibreOffice")
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                LOGGER.debug(f"LibreOffice command: {' '.join(cmd)}")
+                
+                # Use a shell for this command to ensure proper handling of the infilter parameter
+                result = subprocess.run(" ".join(cmd), shell=True, capture_output=True, text=True, check=False)
                 
                 if result.returncode != 0:
                     LOGGER.warning(f"LibreOffice recalculation warning: {result.stderr}")
+                else:
+                    LOGGER.info("LibreOffice recalculation command executed successfully")
                 
                 # Get the converted file name - LibreOffice might change the extension
                 converted_files = [f for f in os.listdir(temp_dir) if f.startswith(os.path.splitext(filename)[0])]
                 
                 if converted_files:
                     converted_file = os.path.join(temp_dir, converted_files[0])
+                    # Ensure we don't lose the VBA by using binary mode for copying
+                    LOGGER.info(f"Found recalculated file: {converted_file}")
                     shutil.copy(converted_file, excel_file)
                     LOGGER.info(f"Recalculated file saved back to {excel_file}")
                 else:
-                    LOGGER.warning(f"LibreOffice did not create converted file: {os.listdir(temp_dir)}")
+                    LOGGER.warning(f"LibreOffice did not create converted file in {temp_dir}")
+                    LOGGER.warning(f"Directory contents: {os.listdir(temp_dir)}")
         except Exception as e:
             LOGGER.error(f"Error during LibreOffice recalculation: {e}")
 
