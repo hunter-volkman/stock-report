@@ -6,7 +6,6 @@ import re
 from datetime import datetime, timedelta
 from dateutil import tz
 import openpyxl
-from openpyxl.utils import get_column_letter
 from viam.logging import getLogger
 
 LOGGER = getLogger(__name__)
@@ -27,12 +26,6 @@ class WorkbookProcessor:
         self.export_end_time_weekday = export_end_time_weekday
         self.export_start_time_weekend = export_start_time_weekend
         self.export_end_time_weekend = export_end_time_weekend
-        # Check if LibreOffice is available for formula recalculation
-        self.libreoffice_available = self._check_libreoffice()
-        if self.libreoffice_available:
-            LOGGER.info("LibreOffice is available for formula recalculation")
-        else:
-            LOGGER.warning("LibreOffice not found - complex formula recalculation may be limited")
 
         # Check for viam-python-data-export virtual environment
         self.venv_path = os.path.join(self.export_script_dir, ".venv")
@@ -48,8 +41,6 @@ class WorkbookProcessor:
             setup_script = os.path.join(self.export_script_dir, "setup.sh")
             if os.path.exists(setup_script):
                 LOGGER.info(f"Running setup script for viam-python-data-export: {setup_script}")
-                # Cannot source the script directly (can simulate it)
-                # Running bash with -c and sourcing the script
                 subprocess.run(
                     ["bash", "-c", f"cd {self.export_script_dir} && source ./setup.sh"],
                     check=True,
@@ -60,43 +51,6 @@ class WorkbookProcessor:
                 LOGGER.error(f"Setup script not found at {setup_script}")
         except Exception as e:
             LOGGER.error(f"Failed to set up viam-python-data-export virtual environment: {e}")
-
-    def _check_libreoffice(self):
-        """Check if LibreOffice is available on the system."""
-        try:
-            result = subprocess.run(
-                ["which", "libreoffice"], 
-                capture_output=True, 
-                text=True, 
-                check=False
-            )
-            return result.returncode == 0
-        except Exception:
-            return False
-
-    def _extract_date_from_filename(self, filename):
-        """Extract date from template filename like 3895th_MMDDYY.xlsx."""
-        try:
-            # Extract MMDDYY portion from the filename
-            match = re.search(r'3895th_(\d{6})\.xlsx', os.path.basename(filename))
-            if match:
-                date_str = match.group(1)
-                # Parse as month, day, year
-                month = int(date_str[0:2])
-                day = int(date_str[2:4])
-                # Convert 2-digit year to 4-digit year
-                year = int(date_str[4:6])
-                # Assume 20xx for the century (valid until 2099)
-                year += 2000
-                
-                # Create date object
-                return datetime(year, month, day, tzinfo=tz.gettz(self.timezone))
-            else:
-                LOGGER.warning(f"Could not extract date from filename: {filename}")
-                return None
-        except Exception as e:
-            LOGGER.error(f"Error parsing date from filename {filename}: {e}")
-            return None
 
     def get_yesterday_date(self):
         """Get yesterday's date in the configured timezone."""
@@ -168,7 +122,6 @@ class WorkbookProcessor:
                 cmd_mask[idx + 1] = "<redacted>"
 
         try:
-            # Run in the script's directory to handle relative paths
             # Log the masked command
             LOGGER.info(f"Running vde.py command: {' '.join(cmd_mask)}")
             process = subprocess.run(
@@ -179,17 +132,17 @@ class WorkbookProcessor:
                 text=True
             )
             
-            # Log important parts of the output but not everything to avoid spam
+            # Log a summary of the output
             stdout_lines = process.stdout.strip().split('\n')
             if stdout_lines:
-                # Log first 5 lines and last 5 lines (if there's a lot of output)
-                if len(stdout_lines) > 10:
+                # Log first 2 lines and last 2 lines if there's a lot of output
+                if len(stdout_lines) > 4:
                     LOGGER.info("vde.py output first lines:")
-                    for line in stdout_lines[:5]:
+                    for line in stdout_lines[:2]:
                         LOGGER.info(f"  {line}")
                     LOGGER.info("...")
                     LOGGER.info("vde.py output last lines:")
-                    for line in stdout_lines[-5:]:
+                    for line in stdout_lines[-2:]:
                         LOGGER.info(f"  {line}")
                 else:
                     # Just log all if it's not too much
@@ -211,91 +164,28 @@ class WorkbookProcessor:
                     LOGGER.error(f"  {line}")
             raise RuntimeError(f"vde.py export failed: {e}")
 
-    def _recalculate_with_libreoffice(self, excel_file):
-        """
-        Use LibreOffice to ensure formulas are recalculated while preserving charts.
-        This enhanced version ensures charts are retained during processing.
-        """
-        if not self.libreoffice_available:
-            LOGGER.warning("Skipping LibreOffice recalculation (not available)")
-            return
-            
-        try:
-            # Create a temporary directory for the conversion
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Get filename without path
-                filename = os.path.basename(excel_file)
-                
-                # Construct LibreOffice command for silent recalculation
-                # --infilter="Microsoft Excel 2007-365 XML (*.xlsx):FOURM=67,VBAON=1" is crucial
-                # This tells LibreOffice to preserve VBA macros and charts
-                cmd = [
-                    "libreoffice", 
-                    "--headless", 
-                    "--calc", 
-                    "--infilter=\"Microsoft Excel 2007-365 XML (*.xlsx):FOURM=67,VBAON=1\"",
-                    "--convert-to", 
-                    "xlsx:\"Calc MS Excel 2007 XML:VBAON=1\"", 
-                    "--outdir", 
-                    temp_dir,
-                    excel_file
-                ]
-                
-                LOGGER.info(f"Recalculating formulas in {excel_file} with LibreOffice")
-                LOGGER.debug(f"LibreOffice command: {' '.join(cmd)}")
-                
-                # Use a shell for this command to ensure proper handling of the infilter parameter
-                result = subprocess.run(" ".join(cmd), shell=True, capture_output=True, text=True, check=False)
-                
-                if result.returncode != 0:
-                    LOGGER.warning(f"LibreOffice recalculation warning: {result.stderr}")
-                else:
-                    LOGGER.info("LibreOffice recalculation command executed successfully")
-                
-                # Get the converted file name - LibreOffice might change the extension
-                converted_files = [f for f in os.listdir(temp_dir) if f.startswith(os.path.splitext(filename)[0])]
-                
-                if converted_files:
-                    converted_file = os.path.join(temp_dir, converted_files[0])
-                    # Ensure we don't lose the VBA by using binary mode for copying
-                    LOGGER.info(f"Found recalculated file: {converted_file}")
-                    shutil.copy(converted_file, excel_file)
-                    LOGGER.info(f"Recalculated file saved back to {excel_file}")
-                else:
-                    LOGGER.warning(f"LibreOffice did not create converted file in {temp_dir}")
-                    LOGGER.warning(f"Directory contents: {os.listdir(temp_dir)}")
-        except Exception as e:
-            LOGGER.error(f"Error during LibreOffice recalculation: {e}")
-
     def update_master_workbook(self, raw_file, master_template, target_date=None):
         """
-        Copy data from raw export to master workbook and update formulas.
-        Enhanced version to preserve charts and VBA components.
+        Simple approach: Copy data from raw export to the Raw Import tab and let
+        Excel's automatic calculation handle the rest.
         
         Args:
             raw_file: Path to the raw data export file
-            master_template: Path to the master template to use as a base
-            target_date: Date for the target workbook (if None, extract from template or use current date)
+            master_template: Path to the master template to use as a base (ignored, we determine based on target date)
+            target_date: Date for the target workbook (if None, use yesterday)
         """
         # Determine the target date for the new workbook
         if target_date is None:
-            # Extract date from the template filename
-            template_date = self._extract_date_from_filename(master_template)
-            if template_date:
-                # The new file should be for the day after the template date
-                target_date = template_date + timedelta(days=1)
-                LOGGER.info(f"Using date from template: {template_date.strftime('%Y-%m-%d')} → {target_date.strftime('%Y-%m-%d')}")
-            else:
-                # Fall back to current date if we can't extract
-                target_date = datetime.now(tz.gettz(self.timezone))
-                LOGGER.warning(f"Could not extract date from template filename, using current date: {target_date.strftime('%Y-%m-%d')}")
+            target_date = self.get_yesterday_date()
+            LOGGER.info(f"No target date provided, using yesterday: {target_date.strftime('%Y-%m-%d')}")
         
         # Format the date string for the filename
         target_str = target_date.strftime("%m%d%y")
         new_master_file = os.path.join(self.work_dir, f"3895th_{target_str}.xlsx")
 
         # Use weekday or weekend template based on the target date
-        template_name = "template_weekday.xlsx" if target_date.weekday() < 5 else "template_weekend.xlsx"
+        is_weekday = target_date.weekday() < 5  # Mon=0, Sun=6
+        template_name = "template_weekday.xlsx" if is_weekday else "template_weekend.xlsx"
         master_template = os.path.join(self.work_dir, template_name)
         
         if not os.path.exists(master_template):
@@ -304,17 +194,17 @@ class WorkbookProcessor:
 
         LOGGER.info(f"Creating new master workbook: {new_master_file} for {target_date.strftime('%Y-%m-%d')} using template {master_template}")
         
-        # Create a binary copy of the template to ensure all elements are preserved
+        # Create a binary copy of the template (preserves all charts and VBA)
         with open(master_template, 'rb') as src, open(new_master_file, 'wb') as dst:
             dst.write(src.read())
         
         try:
-            # Load workbooks - make sure to use keep_vba=True to preserve macros and charts
+            # Load workbooks - make sure to keep_vba=True to preserve any macros
             LOGGER.info(f"Loading raw data from {raw_file}")
-            raw_wb = openpyxl.load_workbook(raw_file, data_only=True)  # Use data_only=True to get values
+            raw_wb = openpyxl.load_workbook(raw_file, data_only=True)
 
             LOGGER.info(f"Loading master workbook from {new_master_file}")
-            master_wb = openpyxl.load_workbook(new_master_file, data_only=False, keep_vba=True)
+            master_wb = openpyxl.load_workbook(new_master_file, keep_vba=True)
 
             # Check if RAW sheet exists in raw workbook
             if "RAW" not in raw_wb.sheetnames:
@@ -330,25 +220,27 @@ class WorkbookProcessor:
                 
             import_sheet = master_wb["Raw Import"]
 
-            # Clear existing data in the import sheet, but be careful not to clear headers
-            # Determine how many header rows to preserve based on your workbook structure
-            header_rows = 1  # Adjust if your sheet has more header rows
+            # Clear existing data in import sheet, preserving headers
+            header_rows = 1  # Usually just one header row
             
             LOGGER.info(f"Clearing existing data in Raw Import sheet (preserving {header_rows} header rows)")
-            for row_idx, row in enumerate(import_sheet.iter_rows(min_row=header_rows+1), start=header_rows+1):
+            for row in import_sheet.iter_rows(min_row=header_rows+1):
                 for cell in row:
                     cell.value = None
 
-            # Get header from raw sheet for column matching
-            raw_headers = [cell.value for cell in next(raw_sheet.rows)]
-            
             # Copy data from RAW to Raw Import
             LOGGER.info("Copying data from RAW to Raw Import")
-            row_count = 0
-            
-            # Start copying from the second row (after headers)
             data_rows = list(raw_sheet.rows)
             
+            # Count how many rows we expect based on weekday/weekend
+            expected_rows = 156 if is_weekday else 96  # 156 rows (weekday) or 96 rows (weekend)
+            actual_rows = len(data_rows) - 1  # Subtract 1 for header
+            
+            if actual_rows < expected_rows:
+                LOGGER.warning(f"Expected {expected_rows} data rows but found only {actual_rows}. Continuing with available data.")
+            
+            row_count = 0
+            # Start copying from the second row (after headers)
             for row_idx, row in enumerate(data_rows[1:], start=header_rows+1):
                 for col_idx, cell in enumerate(row, start=1):
                     import_sheet.cell(row=row_idx, column=col_idx).value = cell.value
@@ -361,12 +253,9 @@ class WorkbookProcessor:
             LOGGER.info(f"Saving updated workbook to {new_master_file}")
             master_wb.save(new_master_file)
             
-            # Ensure all references to master_wb are removed so file isn't locked
+            # Ensure all references to workbooks are removed before proceeding
+            del raw_wb
             del master_wb
-            
-            # Use LibreOffice for formula recalculation to refresh charts
-            LOGGER.info("Running LibreOffice recalculation to update formulas and charts")
-            self._recalculate_with_libreoffice(new_master_file)
             
             LOGGER.info(f"Updated workbook successfully saved at {new_master_file}")
             return new_master_file
@@ -374,7 +263,7 @@ class WorkbookProcessor:
             LOGGER.error(f"Error updating master workbook: {e}")
             if os.path.exists(new_master_file):
                 try:
-                    # Try to keep the file for troubleshooting
+                    # Keep the file for troubleshooting
                     error_file = f"{new_master_file}.error"
                     shutil.copy(new_master_file, error_file)
                     LOGGER.info(f"Saved error state to {error_file}")
@@ -401,8 +290,8 @@ class WorkbookProcessor:
         
         raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
         
-        # Pass the target date to run_vde_export to use the correct date and times
+        # Get the raw data
         self.run_vde_export(raw_file, target_date)
         
-        # Use the target date to select the correct template
+        # Update the master workbook with the raw data
         return self.update_master_workbook(raw_file, None, target_date)
