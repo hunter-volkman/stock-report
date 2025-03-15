@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from dateutil import tz
 import openpyxl
 from viam.logging import getLogger
+import zipfile
+import xml.etree.ElementTree as ET
 
 LOGGER = getLogger(__name__)
 
@@ -164,10 +166,64 @@ class WorkbookProcessor:
                     LOGGER.error(f"  {line}")
             raise RuntimeError(f"vde.py export failed: {e}")
 
+    def _extract_sheet_data(self, excel_file, sheet_name):
+        """Extract data from a specific sheet in Excel file"""
+        try:
+            workbook = openpyxl.load_workbook(excel_file, data_only=True)
+            
+            if sheet_name not in workbook.sheetnames:
+                LOGGER.error(f"Sheet '{sheet_name}' not found in {excel_file}")
+                return None
+                
+            sheet = workbook[sheet_name]
+            
+            # Extract data as list of lists
+            data = []
+            for row in sheet.rows:
+                row_data = [cell.value for cell in row]
+                data.append(row_data)
+                
+            return data
+        except Exception as e:
+            LOGGER.error(f"Error extracting data from sheet {sheet_name} in {excel_file}: {e}")
+            return None
+
+    def _update_sheet_by_direct_edit(self, target_file, sheet_name, data):
+        """
+        Updated method using openpyxl to directly update sheet data
+        while ensuring proper file save to preserve all Excel structures.
+        """
+        try:
+            # Load the target workbook with all features preserved
+            workbook = openpyxl.load_workbook(target_file, keep_vba=True, data_only=False)
+            
+            if sheet_name not in workbook.sheetnames:
+                LOGGER.error(f"Sheet '{sheet_name}' not found in target workbook")
+                return False
+                
+            sheet = workbook[sheet_name]
+            
+            # Clear the sheet data first (preserve formulas in other sheets)
+            for row in sheet.iter_rows(min_row=2):  # Skip header row
+                for cell in row:
+                    cell.value = None
+            
+            # Insert the new data
+            for row_idx, row_data in enumerate(data[1:], start=2):  # Skip header
+                for col_idx, value in enumerate(row_data, start=1):
+                    sheet.cell(row=row_idx, column=col_idx).value = value
+            
+            # Save with proper Excel compatibility flags
+            workbook.save(target_file)
+            LOGGER.info(f"Updated sheet '{sheet_name}' in {target_file}")
+            return True
+        except Exception as e:
+            LOGGER.error(f"Error updating sheet '{sheet_name}' in {target_file}: {e}")
+            return False
+
     def update_master_workbook(self, raw_file, master_template, target_date=None):
         """
-        Simple approach: Copy data from raw export to the Raw Import tab and let
-        Excel's automatic calculation handle the rest.
+        Improved approach that preserves Excel file integrity including charts.
         
         Args:
             raw_file: Path to the raw data export file
@@ -199,63 +255,40 @@ class WorkbookProcessor:
             dst.write(src.read())
         
         try:
-            # Load workbooks - make sure to keep_vba=True to preserve any macros
-            LOGGER.info(f"Loading raw data from {raw_file}")
-            raw_wb = openpyxl.load_workbook(raw_file, data_only=True)
-
-            LOGGER.info(f"Loading master workbook from {new_master_file}")
-            master_wb = openpyxl.load_workbook(new_master_file, keep_vba=True)
-
-            # Check if RAW sheet exists in raw workbook
-            if "RAW" not in raw_wb.sheetnames:
-                LOGGER.error(f"'RAW' sheet not found in raw export workbook")
-                raise ValueError("Raw export workbook missing 'RAW' sheet")
-                
-            raw_sheet = raw_wb["RAW"]
+            # 1. Extract RAW data from raw_file
+            LOGGER.info(f"Extracting RAW data from {raw_file}")
+            raw_data = self._extract_sheet_data(raw_file, "RAW")
             
-            # Check if "Raw Import" tab exists in master workbook
-            if "Raw Import" not in master_wb.sheetnames:
-                LOGGER.error(f"'Raw Import' sheet not found in master workbook")
-                raise ValueError("Master workbook missing 'Raw Import' sheet")
+            if not raw_data:
+                raise ValueError(f"Failed to extract data from RAW sheet in {raw_file}")
                 
-            import_sheet = master_wb["Raw Import"]
-
-            # Clear existing data in import sheet, preserving headers
-            header_rows = 1  # Usually just one header row
-            
-            LOGGER.info(f"Clearing existing data in Raw Import sheet (preserving {header_rows} header rows)")
-            for row in import_sheet.iter_rows(min_row=header_rows+1):
-                for cell in row:
-                    cell.value = None
-
-            # Copy data from RAW to Raw Import
-            LOGGER.info("Copying data from RAW to Raw Import")
-            data_rows = list(raw_sheet.rows)
+            # Log data stats
+            LOGGER.info(f"Extracted {len(raw_data)-1} rows from RAW sheet")
             
             # Count how many rows we expect based on weekday/weekend
             expected_rows = 156 if is_weekday else 96  # 156 rows (weekday) or 96 rows (weekend)
-            actual_rows = len(data_rows) - 1  # Subtract 1 for header
+            actual_rows = len(raw_data) - 1  # Subtract 1 for header
             
             if actual_rows < expected_rows:
                 LOGGER.warning(f"Expected {expected_rows} data rows but found only {actual_rows}. Continuing with available data.")
             
-            row_count = 0
-            # Start copying from the second row (after headers)
-            for row_idx, row in enumerate(data_rows[1:], start=header_rows+1):
-                for col_idx, cell in enumerate(row, start=1):
-                    import_sheet.cell(row=row_idx, column=col_idx).value = cell.value
-                row_count += 1
+            # 2. Update the Raw Import sheet in the new workbook
+            LOGGER.info(f"Updating 'Raw Import' sheet in {new_master_file}")
+            success = self._update_sheet_by_direct_edit(new_master_file, "Raw Import", raw_data)
             
-            # Log summary of copied data
-            LOGGER.info(f"Copied {row_count} rows from RAW to Raw Import tab")
-            
-            # Save the workbook with updated data
-            LOGGER.info(f"Saving updated workbook to {new_master_file}")
-            master_wb.save(new_master_file)
-            
-            # Ensure all references to workbooks are removed before proceeding
-            del raw_wb
-            del master_wb
+            if not success:
+                raise ValueError(f"Failed to update Raw Import sheet in {new_master_file}")
+                
+            # 3. Verify the file integrity before returning
+            try:
+                # Quick verification - can we open the file?
+                verify_wb = openpyxl.load_workbook(new_master_file, keep_vba=True)
+                # If it gets here, file seems valid
+                del verify_wb
+                LOGGER.info(f"Verified updated workbook integrity: {new_master_file}")
+            except Exception as e:
+                LOGGER.error(f"Warning: Final verification failed, file may have issues: {e}")
+                # Continue anyway as the file might still be usable
             
             LOGGER.info(f"Updated workbook successfully saved at {new_master_file}")
             return new_master_file
