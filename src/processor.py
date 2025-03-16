@@ -1,22 +1,24 @@
-import subprocess
 import os
+import subprocess
 import shutil
-import tempfile
-import re
 from datetime import datetime, timedelta
-from dateutil import tz
+import pandas as pd
 import openpyxl
+import re
+from dateutil import tz
 from viam.logging import getLogger
-import zipfile
-import xml.etree.ElementTree as ET
 
 LOGGER = getLogger(__name__)
 
 class WorkbookProcessor:
+    """
+    WorkbookProcessor class that handles the creation of daily fill reports
+    by processing raw data and updating Excel templates.
+    """
     def __init__(self, work_dir, export_script, api_key_id, api_key, org_id, 
-                 timezone="America/New_York", export_start_time_weekday="7:00", 
-                 export_end_time_weekday="19:00", export_start_time_weekend="8:00", 
-                 export_end_time_weekend="16:00"):
+                timezone="America/New_York", export_start_time_weekday="7:00", 
+                export_end_time_weekday="19:00", export_start_time_weekend="8:00", 
+                export_end_time_weekend="16:00"):
         self.work_dir = work_dir
         self.export_script_path = export_script
         self.export_script_dir = os.path.dirname(export_script)
@@ -28,7 +30,7 @@ class WorkbookProcessor:
         self.export_end_time_weekday = export_end_time_weekday
         self.export_start_time_weekend = export_start_time_weekend
         self.export_end_time_weekend = export_end_time_weekend
-
+        
         # Check for viam-python-data-export virtual environment
         self.venv_path = os.path.join(self.export_script_dir, ".venv")
         if not os.path.exists(self.venv_path):
@@ -64,17 +66,26 @@ class WorkbookProcessor:
         is_weekday = target_date.weekday() < 5  # Mon=0, Sun=6
         start_time_str = self.export_start_time_weekday if is_weekday else self.export_start_time_weekend
         end_time_str = self.export_end_time_weekday if is_weekday else self.export_end_time_weekend
-        return start_time_str, end_time_str
+        return start_time_str, end_time_str, is_weekday
 
-    def run_vde_export(self, output_file, target_date=None):
-        """Run the vde.py script to export raw data for the specified date or yesterday."""
+    def export_raw_data(self, output_file, target_date=None):
+        """
+        Run the vde.py script to export raw data for the specified date.
+        
+        Args:
+            output_file: Path where the raw export file should be saved
+            target_date: Date to export data for (defaults to yesterday)
+            
+        Returns:
+            Tuple of (output_file_path, is_weekday)
+        """
         # Use the provided date or default to yesterday
         if target_date is None:
             target_date = self.get_yesterday_date()
             LOGGER.info(f"No target date provided, using yesterday: {target_date.strftime('%Y-%m-%d')}")
         
         # Get the appropriate export times based on the day
-        start_time_str, end_time_str = self._get_export_times_for_day(target_date)
+        start_time_str, end_time_str, is_weekday = self._get_export_times_for_day(target_date)
         
         # Parse the time strings into hours and minutes
         start_hour, start_minute = map(int, start_time_str.split(':'))
@@ -88,12 +99,11 @@ class WorkbookProcessor:
 
         # Construct the shell script to run vde.py with its virtual environment
         venv_python = os.path.join(self.venv_path, "bin", "python")
-        export_script_path = self.export_script_path
-
+        
         # Build the command        
         cmd = [
             venv_python,
-            export_script_path,
+            self.export_script_path,
             "-vv", 
             "excel",
             "--apiKeyId", self.api_key_id,
@@ -137,17 +147,15 @@ class WorkbookProcessor:
             # Log a summary of the output
             stdout_lines = process.stdout.strip().split('\n')
             if stdout_lines:
-                # Log first 2 lines and last 2 lines if there's a lot of output
+                # Just log a few lines to avoid excessive logging
                 if len(stdout_lines) > 4:
-                    LOGGER.info("vde.py output first lines:")
+                    LOGGER.info("vde.py output (sample):")
                     for line in stdout_lines[:2]:
                         LOGGER.info(f"  {line}")
-                    LOGGER.info("...")
-                    LOGGER.info("vde.py output last lines:")
+                    LOGGER.info("  ...")
                     for line in stdout_lines[-2:]:
                         LOGGER.info(f"  {line}")
                 else:
-                    # Just log all if it's not too much
                     LOGGER.info("vde.py output:")
                     for line in stdout_lines:
                         LOGGER.info(f"  {line}")
@@ -156,7 +164,7 @@ class WorkbookProcessor:
                 raise FileNotFoundError("vde.py ran but raw_export.xlsx was not created.")
             
             LOGGER.info(f"Generated raw data at {output_file}")
-            return output_file
+            return output_file, is_weekday
         except subprocess.CalledProcessError as e:
             LOGGER.error(f"Failed to run vde.py: {e}")
             if e.stderr:
@@ -166,165 +174,108 @@ class WorkbookProcessor:
                     LOGGER.error(f"  {line}")
             raise RuntimeError(f"vde.py export failed: {e}")
 
-    def _extract_sheet_data(self, excel_file, sheet_name):
-        """Extract data from a specific sheet in Excel file"""
+    def process(self, target_date=None):
+        """
+        Main processing function: export the data and update the template.
+        
+        Args:
+            target_date: Date to process (defaults to yesterday)
+            
+        Returns:
+            Path to the generated workbook
+        """
+        os.makedirs(self.work_dir, exist_ok=True)
+        
+        if target_date is None:
+            target_date = self.get_yesterday_date()
+            
+        LOGGER.info(f"Starting workbook processing for date: {target_date.strftime('%Y-%m-%d')}")
+        
         try:
-            workbook = openpyxl.load_workbook(excel_file, data_only=True)
+            # 1. Export raw data
+            raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
+            raw_file, is_weekday = self.export_raw_data(raw_file, target_date)
             
-            if sheet_name not in workbook.sheetnames:
-                LOGGER.error(f"Sheet '{sheet_name}' not found in {excel_file}")
-                return None
-                
-            sheet = workbook[sheet_name]
+            # 2. Determine template and output filenames
+            template_name = "template_weekday.xlsx" if is_weekday else "template_weekend.xlsx"
+            template_path = os.path.join(self.work_dir, template_name)
             
-            # Extract data as list of lists
-            data = []
-            for row in sheet.rows:
-                row_data = [cell.value for cell in row]
-                data.append(row_data)
-                
-            return data
+            output_filename = f"3895th_{target_date.strftime('%m%d%y')}.xlsx"
+            output_path = os.path.join(self.work_dir, output_filename)
+            
+            # Check if template exists
+            if not os.path.exists(template_path):
+                LOGGER.error(f"Template file not found: {template_path}")
+                raise FileNotFoundError(f"Template file not found: {template_path}")
+            
+            # 3. Copy the template to create the new workbook
+            LOGGER.info(f"Creating new workbook from template: {template_path}")
+            shutil.copy(template_path, output_path)
+            
+            # 4. Update the Raw Import sheet
+            self._update_raw_import_sheet(raw_file, output_path)
+            
+            # 5. Save and return the path
+            LOGGER.info(f"Successfully created workbook: {output_path}")
+            return output_path
+            
         except Exception as e:
-            LOGGER.error(f"Error extracting data from sheet {sheet_name} in {excel_file}: {e}")
-            return None
-
-    def _update_sheet_by_direct_edit(self, target_file, sheet_name, data):
+            LOGGER.error(f"Error processing workbook: {e}")
+            raise
+    
+    def _update_raw_import_sheet(self, raw_file, output_file):
         """
-        Updated method using openpyxl to directly update sheet data
-        while ensuring proper file save to preserve all Excel structures.
+        Updates the Raw Import sheet in the output file with data from the raw file.
+        
+        Args:
+            raw_file: Path to the raw export Excel file
+            output_file: Path to the output workbook
         """
         try:
-            # Load the target workbook with all features preserved
-            workbook = openpyxl.load_workbook(target_file, keep_vba=True, data_only=False)
+            # Load data from raw export file
+            LOGGER.info(f"Loading raw data from {raw_file}")
+            raw_wb = openpyxl.load_workbook(raw_file, data_only=True)
             
-            if sheet_name not in workbook.sheetnames:
-                LOGGER.error(f"Sheet '{sheet_name}' not found in target workbook")
-                return False
+            if "RAW" not in raw_wb.sheetnames:
+                LOGGER.error("RAW sheet not found in exported data")
+                raise ValueError("RAW sheet not found in exported data")
                 
-            sheet = workbook[sheet_name]
+            raw_sheet = raw_wb["RAW"]
             
-            # Clear the sheet data first (preserve formulas in other sheets)
-            for row in sheet.iter_rows(min_row=2):  # Skip header row
+            # Get headers and data from raw sheet
+            headers = [cell.value for cell in raw_sheet[1]]
+            data_rows = list(raw_sheet.iter_rows(min_row=2, values_only=True))
+            
+            LOGGER.info(f"Loaded {len(data_rows)} rows of data from raw export")
+            
+            # Open the output workbook
+            LOGGER.info(f"Opening output workbook: {output_file}")
+            output_wb = openpyxl.load_workbook(output_file)
+            
+            if "Raw Import" not in output_wb.sheetnames:
+                LOGGER.error("Raw Import sheet not found in template")
+                raise ValueError("Raw Import sheet not found in template")
+                
+            output_sheet = output_wb["Raw Import"]
+            
+            # Clear existing data from Raw Import sheet (keeping headers)
+            LOGGER.info("Clearing existing data from Raw Import sheet")
+            for row in output_sheet.iter_rows(min_row=2):
                 for cell in row:
                     cell.value = None
             
-            # Insert the new data
-            for row_idx, row_data in enumerate(data[1:], start=2):  # Skip header
-                for col_idx, value in enumerate(row_data, start=1):
-                    sheet.cell(row=row_idx, column=col_idx).value = value
+            # Copy data to Raw Import sheet
+            LOGGER.info("Copying data to Raw Import sheet")
+            for r_idx, row_data in enumerate(data_rows, start=2):
+                for c_idx, value in enumerate(row_data, start=1):
+                    output_sheet.cell(row=r_idx, column=c_idx).value = value
             
-            # Save with proper Excel compatibility flags
-            workbook.save(target_file)
-            LOGGER.info(f"Updated sheet '{sheet_name}' in {target_file}")
-            return True
+            # Save the workbook
+            LOGGER.info(f"Saving updated workbook to {output_file}")
+            output_wb.save(output_file)
+            
+            LOGGER.info(f"Raw Import sheet updated with {len(data_rows)} rows of data")
+            
         except Exception as e:
-            LOGGER.error(f"Error updating sheet '{sheet_name}' in {target_file}: {e}")
-            return False
-
-    def update_master_workbook(self, raw_file, master_template, target_date=None):
-        """
-        Improved approach that preserves Excel file integrity including charts.
-        
-        Args:
-            raw_file: Path to the raw data export file
-            master_template: Path to the master template to use as a base (ignored, we determine based on target date)
-            target_date: Date for the target workbook (if None, use yesterday)
-        """
-        # Determine the target date for the new workbook
-        if target_date is None:
-            target_date = self.get_yesterday_date()
-            LOGGER.info(f"No target date provided, using yesterday: {target_date.strftime('%Y-%m-%d')}")
-        
-        # Format the date string for the filename
-        target_str = target_date.strftime("%m%d%y")
-        new_master_file = os.path.join(self.work_dir, f"3895th_{target_str}.xlsx")
-
-        # Use weekday or weekend template based on the target date
-        is_weekday = target_date.weekday() < 5  # Mon=0, Sun=6
-        template_name = "template_weekday.xlsx" if is_weekday else "template_weekend.xlsx"
-        master_template = os.path.join(self.work_dir, template_name)
-        
-        if not os.path.exists(master_template):
-            LOGGER.error(f"Master template {master_template} not found")
-            raise FileNotFoundError(f"Master template {master_template} not found")
-
-        LOGGER.info(f"Creating new master workbook: {new_master_file} for {target_date.strftime('%Y-%m-%d')} using template {master_template}")
-        
-        # Create a binary copy of the template (preserves all charts and VBA)
-        with open(master_template, 'rb') as src, open(new_master_file, 'wb') as dst:
-            dst.write(src.read())
-        
-        try:
-            # 1. Extract RAW data from raw_file
-            LOGGER.info(f"Extracting RAW data from {raw_file}")
-            raw_data = self._extract_sheet_data(raw_file, "RAW")
-            
-            if not raw_data:
-                raise ValueError(f"Failed to extract data from RAW sheet in {raw_file}")
-                
-            # Log data stats
-            LOGGER.info(f"Extracted {len(raw_data)-1} rows from RAW sheet")
-            
-            # Count how many rows we expect based on weekday/weekend
-            expected_rows = 156 if is_weekday else 96  # 156 rows (weekday) or 96 rows (weekend)
-            actual_rows = len(raw_data) - 1  # Subtract 1 for header
-            
-            if actual_rows < expected_rows:
-                LOGGER.warning(f"Expected {expected_rows} data rows but found only {actual_rows}. Continuing with available data.")
-            
-            # 2. Update the Raw Import sheet in the new workbook
-            LOGGER.info(f"Updating 'Raw Import' sheet in {new_master_file}")
-            success = self._update_sheet_by_direct_edit(new_master_file, "Raw Import", raw_data)
-            
-            if not success:
-                raise ValueError(f"Failed to update Raw Import sheet in {new_master_file}")
-                
-            # 3. Verify the file integrity before returning
-            try:
-                # Quick verification - can we open the file?
-                verify_wb = openpyxl.load_workbook(new_master_file, keep_vba=True)
-                # If it gets here, file seems valid
-                del verify_wb
-                LOGGER.info(f"Verified updated workbook integrity: {new_master_file}")
-            except Exception as e:
-                LOGGER.error(f"Warning: Final verification failed, file may have issues: {e}")
-                # Continue anyway as the file might still be usable
-            
-            LOGGER.info(f"Updated workbook successfully saved at {new_master_file}")
-            return new_master_file
-        except Exception as e:
-            LOGGER.error(f"Error updating master workbook: {e}")
-            if os.path.exists(new_master_file):
-                try:
-                    # Keep the file for troubleshooting
-                    error_file = f"{new_master_file}.error"
-                    shutil.copy(new_master_file, error_file)
-                    LOGGER.info(f"Saved error state to {error_file}")
-                except Exception:
-                    pass
+            LOGGER.error(f"Error updating Raw Import sheet: {e}")
             raise
-
-    def process(self, target_date=None):
-        """
-        Main processing function: run export, update master workbook.
-        
-        Args:
-            target_date: Specific date to process (if None, use yesterday)
-        """
-        os.makedirs(self.work_dir, exist_ok=True)
-        LOGGER.info(f"Starting workbook processing for {target_date.strftime('%Y-%m-%d') if target_date else 'yesterday'}")
-        
-        # Determine the date to process
-        if target_date is None:
-            target_date = self.get_yesterday_date()
-            LOGGER.info(f"No target date provided, processing data for yesterday: {target_date.strftime('%Y-%m-%d')}")
-        else:
-            LOGGER.info(f"Using provided target date: {target_date.strftime('%Y-%m-%d')}")
-        
-        raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
-        
-        # Get the raw data
-        self.run_vde_export(raw_file, target_date)
-        
-        # Update the master workbook with the raw data
-        return self.update_master_workbook(raw_file, None, target_date)
