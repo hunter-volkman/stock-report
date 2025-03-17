@@ -46,14 +46,14 @@ The following attributes are available for this model:
 | `send_time` | string | Optional | Time in `timezone` (`"HH:MM"`) to send the report. Defaults to `"20:00"`. |
 | `process_time` | string | Optional | Time in `timezone` (`"HH:MM"`) to process the workbook. Defaults to 1 hour before `send_time`. |
 
-| `export_start_time_weekday` | string | Optional | Weekday start time in timezone ("HH:MM") for data export (e.g., "7:00"). Defaults to "7:00". |
-| `export_end_time_weekday` | string | Optional | Weekday end time in timezone ("HH:MM") for data export (e.g., "19:00"). Defaults to "19:00". |
-| `export_start_time_weekend` | string | Optional | Weekend start time in timezone ("HH:MM") for data export (e.g., "8:00"). Defaults to "8:00". |
+| `export_start_time_weekday` | string | Optional | Weekday start time in `timezone` (`"HH:MM"`) for data export (e.g., `"7:00"`). Defaults to `"7:00"`. |
+| `export_end_time_weekday` | string | Optional | Weekday end time in `timezone` (`"HH:MM"`) for data export (e.g., `"19:00"`). Defaults to `"19:00"`. |
+| `export_start_time_weekend` | string | Optional | Weekend start time in `timezone` (`"HH:MM"`) for data export (e.g., `"8:00"`). Defaults to `"8:00"`. |
 | `export_end_time_weekend` | string | Optional | Start time in `timezone` (`"HH:MM"`) for data export. Defaults to `"7:00"`. |
 
 
-| `timezone` | string | Optional | Timezone for scheduling (e.g., "America/New_York"). Defaults to "America/New_York". |
-| `save_dir` | string | Optional | Directory for workbooks and templates (e.g., "/home/user/workbooks"). Defaults to "/home/hunter.volkman/workbooks". |
+| `timezone` | string | Optional | Timezone for scheduling (e.g., `"America/New_York"`). Defaults to `"America/New_York"`. |
+| `save_dir` | string | Optional | Directory for workbooks and templates (e.g., `"/home/user.name/workbooks"`). Defaults to `"/home/hunter.volkman/workbooks"`. |
 | `export_script` | string | Optional | Path to `vde.py`. Defaults to `"/home/hunter.volkman/viam-python-data-export/vde.py"`. |
 
 
