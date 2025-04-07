@@ -17,9 +17,14 @@ class WorkbookProcessor:
     by processing raw data, updating Excel templates, and fixing XML-level formulas and row counts.
     """
     def __init__(self, work_dir, export_script, api_key_id, api_key, org_id, 
-                 timezone="America/New_York", export_start_time_weekday="7:00", 
-                 export_end_time_weekday="19:00", export_start_time_weekend="8:00", 
-                 export_end_time_weekend="16:00"):
+                 timezone="America/New_York", 
+                 hours_mon=("07:00", "19:30"),
+                 hours_tue=("07:00", "19:30"),
+                 hours_wed=("07:00", "19:30"),
+                 hours_thu=("07:00", "19:30"),
+                 hours_fri=("07:00", "19:30"),
+                 hours_sat=("08:00", "17:00"),
+                 hours_sun=("08:00", "17:00")):
         """
         Initialize the WorkbookProcessor with configuration parameters.
 
@@ -30,10 +35,13 @@ class WorkbookProcessor:
             api_key (str): Viam API key for authentication.
             org_id (str): Viam organization ID.
             timezone (str): Timezone for date handling (default: "America/New_York").
-            export_start_time_weekday (str): Start time for weekday exports (e.g., "7:00").
-            export_end_time_weekday (str): End time for weekday exports (e.g., "19:00").
-            export_start_time_weekend (str): Start time for weekend exports (e.g., "8:00").
-            export_end_time_weekend (str): End time for weekend exports (e.g., "16:00").
+            hours_mon (tuple): Opening and closing hours for Monday (e.g., ("07:00", "19:30")).
+            hours_tue (tuple): Opening and closing hours for Tuesday.
+            hours_wed (tuple): Opening and closing hours for Wednesday.
+            hours_thu (tuple): Opening and closing hours for Thursday.
+            hours_fri (tuple): Opening and closing hours for Friday.
+            hours_sat (tuple): Opening and closing hours for Saturday.
+            hours_sun (tuple): Opening and closing hours for Sunday.
         """
         self.work_dir = work_dir
         self.export_script_path = export_script
@@ -42,12 +50,19 @@ class WorkbookProcessor:
         self.api_key = api_key
         self.org_id = org_id
         self.timezone = timezone
-        self.export_start_time_weekday = export_start_time_weekday
-        self.export_end_time_weekday = export_end_time_weekday
-        self.export_start_time_weekend = export_start_time_weekend
-        self.export_end_time_weekend = export_end_time_weekend
         
-        # Check for viam-python-data-export virtual environment
+        # Store hours for each day of the week (0=Monday, 6=Sunday)
+        self.store_hours = {
+            0: hours_mon,  # Monday
+            1: hours_tue,  # Tuesday
+            2: hours_wed,  # Wednesday
+            3: hours_thu,  # Thursday
+            4: hours_fri,  # Friday
+            5: hours_sat,  # Saturday
+            6: hours_sun   # Sunday
+        }
+        
+        # Check if viam-python-data-export virtual environment exists
         self.venv_path = os.path.join(self.export_script_dir, ".venv")
         if not os.path.exists(self.venv_path):
             LOGGER.warning(f"viam-python-data-export virtual environment not found at {self.venv_path}, attempting to set it up")
@@ -77,12 +92,24 @@ class WorkbookProcessor:
         now = datetime.now(tz.gettz(self.timezone))
         return now - timedelta(days=1)
 
-    def _get_export_times_for_day(self, target_date):
-        """Determine export start and end times based on whether it's a weekday or weekend."""
-        is_weekday = target_date.weekday() < 5  # Mon=0, Sun=6
-        start_time_str = self.export_start_time_weekday if is_weekday else self.export_start_time_weekend
-        end_time_str = self.export_end_time_weekday if is_weekday else self.export_end_time_weekend
-        return start_time_str, end_time_str, is_weekday
+    def _get_store_hours(self, target_date):
+        """
+        Get store opening and closing times for the specified date.
+        
+        Args:
+            target_date (datetime): The date to get store hours for.
+            
+        Returns:
+            tuple: (opening_time, closing_time, weekday) where opening_time and closing_time
+                  are strings in "HH:MM" format, and weekday is the day of week (0-6).
+        """
+        # Get day of week (0=Monday, 6=Sunday)
+        weekday = target_date.weekday()
+        
+        # Get store hours for this day
+        opening_time, closing_time = self.store_hours[weekday]
+        
+        return opening_time, closing_time, weekday
 
     def export_raw_data(self, output_file, target_date=None):
         """
@@ -93,16 +120,16 @@ class WorkbookProcessor:
             target_date (datetime, optional): Date to export data for (defaults to yesterday).
             
         Returns:
-            tuple: (output_file_path, is_weekday) where output_file_path is the path to the exported file
-                   and is_weekday is a boolean indicating if the target_date is a weekday.
+            tuple: (output_file_path, weekday) where output_file_path is the path to the exported file
+                   and weekday is the day of week (0-6) with 0 being Monday.
         """
         # Use the provided date or default to yesterday
         if target_date is None:
             target_date = self.get_yesterday_date()
             LOGGER.info(f"No target date provided, using yesterday: {target_date.strftime('%Y-%m-%d')}")
         
-        # Get the appropriate export times based on the day
-        start_time_str, end_time_str, is_weekday = self._get_export_times_for_day(target_date)
+        # Get store hours for the target date
+        start_time_str, end_time_str, weekday = self._get_store_hours(target_date)
         
         # Parse the time strings into hours and minutes
         start_hour, start_minute = map(int, start_time_str.split(':'))
@@ -114,7 +141,8 @@ class WorkbookProcessor:
 
         LOGGER.info(f"Exporting data from {start_time} to {end_time} ({start_time_str} to {end_time_str})")
 
-        # Construct the shell script to run vde.py with its virtual environment
+        # Construct the shell script to run vde.py 
+        # Use specific viam-python-data-export virtual environment
         venv_python = os.path.join(self.venv_path, "bin", "python")
         
         # Build the command        
@@ -137,18 +165,18 @@ class WorkbookProcessor:
             "--tab", "RAW"
         ]
 
-        # Create a masked version of the command for logging
+        # Create a masked version of the command (for logging)
         cmd_mask = cmd.copy()
 
-        # Find the index of the sensitive parameters and mask them
+        # Find the index of sensitive parameters to mask them
         if "--apiKeyId" in cmd_mask:
             idx = cmd_mask.index("--apiKeyId")
             if idx + 1 < len(cmd_mask):
-                cmd_mask[idx + 1] = "<redacted>"
+                cmd_mask[idx + 1] = "XXXXXXXXXX"
         if "--apiKey" in cmd_mask:
             idx = cmd_mask.index("--apiKey")
             if idx + 1 < len(cmd_mask):
-                cmd_mask[idx + 1] = "<redacted>"
+                cmd_mask[idx + 1] = "XXXXXXXXXX"
 
         try:
             # Log the masked command
@@ -161,6 +189,7 @@ class WorkbookProcessor:
                 text=True
             )
             
+            # TODO: Fix this logging code
             # Log a summary of the output
             stdout_lines = process.stdout.strip().split('\n')
             if stdout_lines:
@@ -181,7 +210,7 @@ class WorkbookProcessor:
                 raise FileNotFoundError("vde.py ran but raw_export.xlsx was not created.")
             
             LOGGER.info(f"Generated raw data at {output_file}")
-            return output_file, is_weekday
+            return output_file, weekday
         except subprocess.CalledProcessError as e:
             LOGGER.error(f"Failed to run vde.py: {e}")
             if e.stderr:
@@ -273,13 +302,13 @@ class WorkbookProcessor:
         try:
             # 1. Export raw data
             raw_file = os.path.join(self.work_dir, "raw_export.xlsx")
-            raw_file, is_weekday = self.export_raw_data(raw_file, target_date)
+            raw_file, weekday = self.export_raw_data(raw_file, target_date)
             
-            # 2. Determine template and output filenames
-            # Using a single template file regardless of weekday/weekend
+            # 2. Use a single template file
             template_path = os.path.join(self.work_dir, "template.xlsx")
             
-            output_filename = f"3895th_{target_date.strftime('%m%d%y')}_wip.xlsx"  # Intermediate WIP file
+            # Intermediate WIP file
+            output_filename = f"3895th_{target_date.strftime('%m%d%y')}_wip.xlsx"
             output_path = os.path.join(self.work_dir, output_filename)
             
             # Check if template exists
@@ -310,7 +339,7 @@ class WorkbookProcessor:
             excel_path (str): Path to the Excel file.
 
         Returns:
-            dict: Mapping of sheet names to actual worksheet XML file names (e.g., "Sorted Raw" -> "sheet5.xml").
+            dict: Mapping of sheet names to actual worksheet XML file names (e.g., "Calibrated Values" -> "sheet4.xml").
         """
         temp_dir = os.path.join(self.work_dir, "temp_excel")
         os.makedirs(temp_dir, exist_ok=True)
@@ -363,15 +392,16 @@ class WorkbookProcessor:
             LOGGER.error(f"Error extracting sheet mappings: {e}")
             raise
         finally:
-            # Cleanup - but don't remove if we're using this directory for fix operation
+            # Cleanup
+            # Don't remove if we're using this directory for fix operation
             if os.path.exists(temp_dir) and "temp_excel" not in excel_path:
                 shutil.rmtree(temp_dir)
 
     def fix(self, wip_path, num_data_rows):
         """
-        Improved fix method that updates Excel workbook XML properly.
+        Updated fix method that correctly handles all relevant sheets in the workbook.
         """
-        # Define temp directory with a unique name to avoid conflicts
+        # Define temp directory with a unique name to avoid any conflicts
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         temp_dir = os.path.join(self.work_dir, f"temp_excel_{timestamp}")
         
@@ -416,7 +446,9 @@ class WorkbookProcessor:
                 raise FileNotFoundError(f"Worksheets directory not found: {worksheets_dir}")
             
             # Process each sheet that needs fixing
-            for sheet_name in ["Sorted Raw", "Calibrated Values", "Bounded Calibrated"]:
+            sheets_to_process = ["Calibrated Values", "Bounded Calibrated", "Empty Shelf Tracker"]
+            
+            for sheet_name in sheets_to_process:
                 if sheet_name not in sheet_mappings:
                     LOGGER.warning(f"Sheet '{sheet_name}' not found in workbook. Skipping...")
                     continue
@@ -450,57 +482,7 @@ class WorkbookProcessor:
                         sheet_data.remove(row)
                         LOGGER.info(f"Removed excess row {row.attrib.get('r')} from {sheet_name}")
                     
-                    # Handle the SORT formula for Sorted Raw sheet
-                    if sheet_name == "Sorted Raw":
-                        LOGGER.info(f"Updating SORT formula in {sheet_name}")
-                        
-                        # Find cell A2 where the SORT formula should be
-                        cell_a2 = None
-                        for row in sheet_data.findall(".//ns:row", namespaces):
-                            if row.attrib.get("r") == "2":
-                                for cell in row.findall(".//ns:c", namespaces):
-                                    if cell.attrib.get("r") == "A2":
-                                        cell_a2 = cell
-                                        break
-                        
-                        # If A2 cell not found, we need to create it
-                        if cell_a2 is None:
-                            LOGGER.info("Cell A2 not found, creating it")
-                            # Look for row 2
-                            row_2 = None
-                            for row in sheet_data.findall(".//ns:row", namespaces):
-                                if row.attrib.get("r") == "2":
-                                    row_2 = row
-                                    break
-                            
-                            # If row 2 doesn't exist, create it
-                            if row_2 is None:
-                                LOGGER.info("Row 2 not found, creating it")
-                                row_2 = ET.SubElement(sheet_data, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row")
-                                row_2.set("r", "2")
-                            
-                            # Create cell A2
-                            cell_a2 = ET.SubElement(row_2, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c")
-                            cell_a2.set("r", "A2")
-                        
-                        # Update or create formula element
-                        formula = cell_a2.find(".//ns:f", namespaces)
-                        if formula is None:
-                            formula = ET.SubElement(cell_a2, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}f")
-                        
-                        # Set the updated formula with the correct row count
-                        sort_formula = f"_xlfn._xlws.SORT('Raw Import'!A2:X{num_data_rows + 1},1,1)"
-                        formula.text = sort_formula
-                        formula.set("t", "array")
-                        formula.set("ref", f"A2:X{num_data_rows + 1}")
-                        
-                        # Ensure there's a value element
-                        value = cell_a2.find(".//ns:v", namespaces)
-                        if value is None:
-                            value = ET.SubElement(cell_a2, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v")
-                        value.text = "0"
-                        
-                        LOGGER.info(f"Updated SORT formula: {sort_formula}")
+                    # Handle any dynamic formulas if needed for specific sheets
                     
                     # Save the modified sheet XML
                     tree.write(sheet_xml_path, encoding="UTF-8", xml_declaration=True)

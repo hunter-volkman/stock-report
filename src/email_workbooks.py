@@ -53,14 +53,19 @@ class EmailWorkbooks(Sensor, EasyResource):
             except ValueError:
                 raise Exception(f"Invalid process_time '{process_time}': must be in 'HH:MM' format")
 
-        # Validate time settings
-        for time_attribute in ["export_start_time_weekday", "export_end_time_weekday",
-                         "export_start_time_weekend", "export_end_time_weekend"]:
-            if time_attribute in attributes:
-                try:
-                    datetime.datetime.strptime(attributes[time_attribute], "%H:%M")
-                except ValueError:
-                    raise Exception(f"Invalid {time_attribute} '{attributes[time_attribute]}': must be in 'HH:MM' format")
+        # Validate store hours
+        for day in ["hours_mon", "hours_tue", "hours_wed", "hours_thu", "hours_fri", "hours_sat", "hours_sun"]:
+            if day in attributes:
+                hours = attributes[day]
+                if not isinstance(hours, list) or len(hours) != 2:
+                    raise Exception(f"'{day}' must be a list with two elements: [opening_time, closing_time]")
+                
+                # Validate each time string
+                for time_str in hours:
+                    try:
+                        datetime.datetime.strptime(str(time_str), "%H:%M")
+                    except ValueError:
+                        raise Exception(f"Invalid time format in '{day}': '{time_str}' - must be in 'HH:MM' format")
                 
         return []
 
@@ -77,11 +82,17 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.api_key_id = ""
         self.api_key = ""
         self.org_id = ""
-        self.timezone = "America/New_York"  # Added for consistent timezone handling
-        self.export_start_time_weekday = "7:00"  # Weekday store opens 7:00 AM EST
-        self.export_end_time_weekday = "19:00"  # Weekday store closes 7:00 PM EST
-        self.export_start_time_weekend = "8:00"  # Weekend store opens 8:00 AM EST
-        self.export_end_time_weekend = "16:00"  # Weekend store closes 4:00 PM EST
+        self.timezone = "America/New_York"
+        
+        # Default store hours
+        self.hours_mon = ("07:00", "19:30")
+        self.hours_tue = ("07:00", "19:30")
+        self.hours_wed = ("07:00", "19:30")
+        self.hours_thu = ("07:00", "19:30")
+        self.hours_fri = ("07:00", "19:30")
+        self.hours_sat = ("08:00", "17:00")
+        self.hours_sun = ("08:00", "17:00")
+        
         self.processor = None
         self.last_processed_date = None
         self.last_processed_time = None
@@ -158,10 +169,15 @@ class EmailWorkbooks(Sensor, EasyResource):
         self.api_key = attributes["api_key"]
         self.org_id = attributes["org_id"]
         self.timezone = attributes.get("timezone", "America/New_York")
-        self.export_start_time_weekday = attributes.get("export_start_time_weekday", "7:00")
-        self.export_end_time_weekday = attributes.get("export_end_time_weekday", "19:00")
-        self.export_start_time_weekend = attributes.get("export_start_time_weekend", "8:00")
-        self.export_end_time_weekend = attributes.get("export_end_time_weekend", "16:00")
+        
+        # Set store hours from config attributes or use defaults if not provided
+        self.hours_mon = tuple(attributes.get("hours_mon", ["07:00", "19:30"]))
+        self.hours_tue = tuple(attributes.get("hours_tue", ["07:00", "19:30"]))
+        self.hours_wed = tuple(attributes.get("hours_wed", ["07:00", "19:30"]))
+        self.hours_thu = tuple(attributes.get("hours_thu", ["07:00", "19:30"]))
+        self.hours_fri = tuple(attributes.get("hours_fri", ["07:00", "19:30"]))
+        self.hours_sat = tuple(attributes.get("hours_sat", ["08:00", "17:00"]))
+        self.hours_sun = tuple(attributes.get("hours_sun", ["08:00", "17:00"]))
 
         self.processor = WorkbookProcessor(
             self.save_dir, 
@@ -170,10 +186,13 @@ class EmailWorkbooks(Sensor, EasyResource):
             self.api_key, 
             self.org_id,
             timezone=self.timezone,
-            export_start_time_weekday=self.export_start_time_weekday,
-            export_end_time_weekday=self.export_end_time_weekday,
-            export_start_time_weekend=self.export_start_time_weekend,
-            export_end_time_weekend=self.export_end_time_weekend
+            hours_mon=self.hours_mon,
+            hours_tue=self.hours_tue,
+            hours_wed=self.hours_wed,
+            hours_thu=self.hours_thu,
+            hours_fri=self.hours_fri,
+            hours_sat=self.hours_sat,
+            hours_sun=self.hours_sun
         )
 
         os.makedirs(self.save_dir, exist_ok=True)
@@ -269,7 +288,7 @@ class EmailWorkbooks(Sensor, EasyResource):
             self.workbook = f"error: invalid date format {date_str}"
             return None
             
-        # Use a single template file regardless of weekday/weekend
+        # Use a single template file
         template_path = os.path.join(self.save_dir, "template.xlsx")
         
         if not os.path.exists(template_path):
