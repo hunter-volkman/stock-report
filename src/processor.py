@@ -131,7 +131,7 @@ class WorkbookProcessor:
             "--end", end_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "--timezone", self.timezone,
             "--bucketPeriod", "PT5M",
-            "--bucketMethod", "max",
+            "--bucketMethod", "pct99",
             "--includeKeys", ".*_raw",
             "--output", output_file,
             "--tab", "RAW"
@@ -276,8 +276,8 @@ class WorkbookProcessor:
             raw_file, is_weekday = self.export_raw_data(raw_file, target_date)
             
             # 2. Determine template and output filenames
-            template_name = "template_weekday.xlsx" if is_weekday else "template_weekend.xlsx"
-            template_path = os.path.join(self.work_dir, template_name)
+            # Using a single template file regardless of weekday/weekend
+            template_path = os.path.join(self.work_dir, "template.xlsx")
             
             output_filename = f"3895th_{target_date.strftime('%m%d%y')}_wip.xlsx"  # Intermediate WIP file
             output_path = os.path.join(self.work_dir, output_filename)
@@ -313,144 +313,223 @@ class WorkbookProcessor:
             dict: Mapping of sheet names to actual worksheet XML file names (e.g., "Sorted Raw" -> "sheet5.xml").
         """
         temp_dir = os.path.join(self.work_dir, "temp_excel")
-        with zipfile.ZipFile(excel_path, "r") as zip_ref:
-            zip_ref.extractall(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        try:
+            with zipfile.ZipFile(excel_path, "r") as zip_ref:
+                zip_ref.extractall(temp_dir)
 
-        workbook_xml_path = os.path.join(temp_dir, "xl", "workbook.xml")
-        rels_xml_path = os.path.join(temp_dir, "xl", "_rels", "workbook.xml.rels")
+            workbook_xml_path = os.path.join(temp_dir, "xl", "workbook.xml")
+            rels_xml_path = os.path.join(temp_dir, "xl", "_rels", "workbook.xml.rels")
 
-        sheet_mapping = {}
+            # Check if the necessary XML files exist
+            if not os.path.exists(workbook_xml_path):
+                raise FileNotFoundError(f"workbook.xml not found in {excel_path}")
+            if not os.path.exists(rels_xml_path):
+                raise FileNotFoundError(f"workbook.xml.rels not found in {excel_path}")
 
-        # Parse workbook.xml to get sheet names and their relationship IDs
-        tree = ET.parse(workbook_xml_path)
-        root = tree.getroot()
-        namespace = {"ns": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            sheet_mapping = {}
 
-        sheet_rel_map = {}  # Stores r:id to sheet name
-        for sheet in root.findall(".//ns:sheets/ns:sheet", namespace):
-            sheet_name = sheet.attrib["name"]
-            sheet_rel_id = sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
-            sheet_rel_map[sheet_rel_id] = sheet_name  # Map r:id to sheet name
+            # Parse workbook.xml to get sheet names and their relationship IDs
+            wb_tree = ET.parse(workbook_xml_path)
+            wb_root = wb_tree.getroot()
+            
+            # Handle Excel namespaces properly
+            ns = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                  'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+            
+            sheet_rel_map = {}  # Map r:id to sheet name
+            for sheet in wb_root.findall(".//ns:sheets/ns:sheet", ns):
+                sheet_name = sheet.attrib["name"]
+                sheet_rel_id = sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
+                sheet_rel_map[sheet_rel_id] = sheet_name
 
-        # Parse workbook.xml.rels to get the actual sheetX.xml filenames
-        tree = ET.parse(rels_xml_path)
-        root = tree.getroot()
-        namespace = {"ns": "http://schemas.openxmlformats.org/package/2006/relationships"}
+            # Parse workbook.xml.rels to get sheet file paths
+            rels_tree = ET.parse(rels_xml_path)
+            rels_root = rels_tree.getroot()
+            rels_ns = {'ns': 'http://schemas.openxmlformats.org/package/2006/relationships'}
 
-        for rel in root.findall(".//ns:Relationship", namespace):
-            rel_id = rel.attrib["Id"]
-            target = rel.attrib["Target"]  # Example: "worksheets/sheet1.xml"
+            for rel in rels_root.findall(".//ns:Relationship", rels_ns):
+                rel_id = rel.attrib["Id"]
+                target = rel.attrib["Target"]
+                
+                if rel_id in sheet_rel_map and "worksheets" in target:
+                    sheet_name = sheet_rel_map[rel_id]
+                    sheet_mapping[sheet_name] = os.path.basename(target)
 
-            # Make sure we only process worksheet files, not chartsheets
-            if rel_id in sheet_rel_map and "worksheets" in target:
-                sheet_name = sheet_rel_map[rel_id]
-                sheet_mapping[sheet_name] = os.path.basename(target)  # Extract only the file name
-
-        shutil.rmtree(temp_dir)  # Clean up
-        LOGGER.info(f"Extracted sheet mappings: {sheet_mapping}")
-        return sheet_mapping
+            return sheet_mapping
+            
+        except Exception as e:
+            LOGGER.error(f"Error extracting sheet mappings: {e}")
+            raise
+        finally:
+            # Cleanup - but don't remove if we're using this directory for fix operation
+            if os.path.exists(temp_dir) and "temp_excel" not in excel_path:
+                shutil.rmtree(temp_dir)
 
     def fix(self, wip_path, num_data_rows):
         """
-        Updates the Excel workbook XML to dynamically adjust formulas and clear excess data.
-
-        Args:
-            wip_path (str): Path to the intermediate (WIP) Excel file.
-            num_data_rows (int): Number of data rows in 'Raw Import' to determine formula range and row cleanup.
-
-        Returns:
-            str: Path to the final updated Excel file.
+        Improved fix method that updates Excel workbook XML properly.
         """
-        temp_dir = os.path.join(self.work_dir, "temp_excel")
-
-        # Extract the Excel ZIP archive
-        LOGGER.info(f"Extracting WIP Excel file: {wip_path}")
-        with zipfile.ZipFile(wip_path, "r") as zip_ref:
-            zip_ref.extractall(temp_dir)
-
-        # Get sheet mappings
-        sheet_mappings = self.get_sheet_mappings(wip_path)
-
-        # Modify the necessary sheet XML files
-        for sheet_name in ["Sorted Raw", "Calibrated Values", "Bounded Calibrated"]:
-            if sheet_name not in sheet_mappings:
-                LOGGER.warning(f"Sheet '{sheet_name}' not found in workbook. Skipping...")
-                continue
-            
-            sheet_xml_path = os.path.join(temp_dir, "xl", "worksheets", sheet_mappings[sheet_name])
-            tree = ET.parse(sheet_xml_path)
-            root = tree.getroot()
-            namespace = {"ns": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-
-            # Locate sheet data section
-            sheet_data = root.find(".//ns:sheetData", namespace)
-            if sheet_data is None:
-                LOGGER.warning(f"No sheetData found in {sheet_name}, skipping modifications")
-                continue
-
-            # Remove extra rows beyond num_data_rows + 1 (header row)
-            excess_rows = []
-            for row in sheet_data.findall("ns:row", namespace):
-                row_number = int(row.attrib.get("r", "0"))
-                if row_number > num_data_rows + 1:
-                    excess_rows.append(row)
-
-            for row in excess_rows:
-                sheet_data.remove(row)
-                LOGGER.info(f"Removed stale row {row.attrib.get('r')} from {sheet_name}")
-
-            # Update Sorted Raw formula (only for A2)
-            if sheet_name == "Sorted Raw":
-                found = False
-                for cell in root.findall(".//ns:c", namespace):
-                    if cell.attrib.get("r") == "A2":
-                        found = True
-                        formula_element = cell.find(".//ns:f", namespace)
-                        if formula_element is None:
-                            formula_element = ET.SubElement(cell, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}f")
-                        
-                        # Correct Excel-recognized formula insertion
-                        formula_element.text = f"_xlfn._xlws.SORT('Raw Import'!A2:X{num_data_rows + 1},1,1)"
-                        formula_element.set("t", "array")  # Mark as array formula
-                        formula_element.set("ref", f"A2:X{num_data_rows + 1}")  # Correct reference
-
-                        # Ensure A2 has a placeholder value to prevent stripping
-                        value_element = cell.find(".//ns:v", namespace)
-                        if value_element is None:
-                            value_element = ET.SubElement(cell, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v")
-                        value_element.text = "0"  # Dummy value
-
-                if not found:
-                    # Create a new A2 cell with the correct formula
-                    new_cell = ET.Element("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c", r="A2")
-                    formula_element = ET.SubElement(new_cell, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}f")
-                    formula_element.text = f"_xlfn._xlws.SORT('Raw Import'!A2:X{num_data_rows + 1},1,1)"
-                    formula_element.set("t", "array")
-                    formula_element.set("ref", f"A2:X{num_data_rows + 1}")
-
-                    # Add a dummy value to prevent Excel from deleting it
-                    value_element = ET.SubElement(new_cell, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v")
-                    value_element.text = "0"
-
-                    sheet_data.insert(1, new_cell)
-
-                LOGGER.info(f"Updated Sorted Raw formula: _xlfn._xlws.SORT('Raw Import'!A2:X{num_data_rows + 1},1,1)")
-
-            # Save the modified XML
-            LOGGER.info(f"Saving modified XML for {sheet_name} at {sheet_xml_path}")
-            tree.write(sheet_xml_path, encoding="UTF-8", xml_declaration=True)
-
-        # Repackage the modified files into a new .xlsx
-        final_path = wip_path.replace("_wip.xlsx", "_final.xlsx")
-        LOGGER.info(f"Repackaging modified files into final Excel file: {final_path}")
-        with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zip_ref:
-            for root_dir, _, files in os.walk(temp_dir):
-                for file in files:
-                    file_path = os.path.join(root_dir, file)
-                    zip_ref.write(file_path, os.path.relpath(file_path, temp_dir))
-
-        # Cleanup
-        shutil.rmtree(temp_dir)
+        # Define temp directory with a unique name to avoid conflicts
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        temp_dir = os.path.join(self.work_dir, f"temp_excel_{timestamp}")
         
-        LOGGER.info(f"Updated Excel file saved at: {final_path}")
-        return final_path
+        try:
+            # Ensure WIP file exists
+            if not os.path.exists(wip_path):
+                LOGGER.error(f"WIP file not found: {wip_path}")
+                raise FileNotFoundError(f"WIP file not found: {wip_path}")
+
+            # Create a fresh temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            os.makedirs(temp_dir, exist_ok=True)
+            LOGGER.info(f"Created temp directory: {temp_dir}")
+            
+            # Extract the Excel file
+            LOGGER.info(f"Extracting WIP Excel file: {wip_path}")
+            with zipfile.ZipFile(wip_path, "r") as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            # Get sheet mappings
+            LOGGER.info("Obtaining sheet mappings")
+            sheet_mappings = self.get_sheet_mappings(wip_path)
+            LOGGER.info(f"Sheet mappings: {sheet_mappings}")
+            
+            # Define namespaces properly
+            namespaces = {
+                'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            }
+            
+            # Register namespaces for proper XML generation
+            for prefix, uri in namespaces.items():
+                ET.register_namespace(prefix, uri)
+            # Also register the default namespace
+            ET.register_namespace('', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+            
+            # Path to worksheets directory
+            worksheets_dir = os.path.join(temp_dir, "xl", "worksheets")
+            if not os.path.exists(worksheets_dir):
+                LOGGER.error(f"Worksheets directory not found: {worksheets_dir}")
+                raise FileNotFoundError(f"Worksheets directory not found: {worksheets_dir}")
+            
+            # Process each sheet that needs fixing
+            for sheet_name in ["Sorted Raw", "Calibrated Values", "Bounded Calibrated"]:
+                if sheet_name not in sheet_mappings:
+                    LOGGER.warning(f"Sheet '{sheet_name}' not found in workbook. Skipping...")
+                    continue
+                
+                sheet_xml_path = os.path.join(worksheets_dir, sheet_mappings[sheet_name])
+                if not os.path.exists(sheet_xml_path):
+                    LOGGER.error(f"Sheet XML file not found: {sheet_xml_path}")
+                    continue
+                
+                LOGGER.info(f"Processing sheet: {sheet_name} ({sheet_xml_path})")
+                
+                # Parse sheet XML
+                try:
+                    tree = ET.parse(sheet_xml_path)
+                    root = tree.getroot()
+                    
+                    # Find sheetData element
+                    sheet_data = root.find(".//ns:sheetData", namespaces)
+                    if sheet_data is None:
+                        LOGGER.warning(f"No sheetData found in {sheet_name}, skipping modifications")
+                        continue
+                    
+                    # Remove excess rows
+                    rows_to_remove = []
+                    for row in sheet_data.findall(".//ns:row", namespaces):
+                        row_number = int(row.attrib.get("r", "0"))
+                        if row_number > num_data_rows + 1:  # +1 for header row
+                            rows_to_remove.append(row)
+                    
+                    for row in rows_to_remove:
+                        sheet_data.remove(row)
+                        LOGGER.info(f"Removed excess row {row.attrib.get('r')} from {sheet_name}")
+                    
+                    # Handle the SORT formula for Sorted Raw sheet
+                    if sheet_name == "Sorted Raw":
+                        LOGGER.info(f"Updating SORT formula in {sheet_name}")
+                        
+                        # Find cell A2 where the SORT formula should be
+                        cell_a2 = None
+                        for row in sheet_data.findall(".//ns:row", namespaces):
+                            if row.attrib.get("r") == "2":
+                                for cell in row.findall(".//ns:c", namespaces):
+                                    if cell.attrib.get("r") == "A2":
+                                        cell_a2 = cell
+                                        break
+                        
+                        # If A2 cell not found, we need to create it
+                        if cell_a2 is None:
+                            LOGGER.info("Cell A2 not found, creating it")
+                            # Look for row 2
+                            row_2 = None
+                            for row in sheet_data.findall(".//ns:row", namespaces):
+                                if row.attrib.get("r") == "2":
+                                    row_2 = row
+                                    break
+                            
+                            # If row 2 doesn't exist, create it
+                            if row_2 is None:
+                                LOGGER.info("Row 2 not found, creating it")
+                                row_2 = ET.SubElement(sheet_data, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row")
+                                row_2.set("r", "2")
+                            
+                            # Create cell A2
+                            cell_a2 = ET.SubElement(row_2, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c")
+                            cell_a2.set("r", "A2")
+                        
+                        # Update or create formula element
+                        formula = cell_a2.find(".//ns:f", namespaces)
+                        if formula is None:
+                            formula = ET.SubElement(cell_a2, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}f")
+                        
+                        # Set the updated formula with the correct row count
+                        sort_formula = f"_xlfn._xlws.SORT('Raw Import'!A2:X{num_data_rows + 1},1,1)"
+                        formula.text = sort_formula
+                        formula.set("t", "array")
+                        formula.set("ref", f"A2:X{num_data_rows + 1}")
+                        
+                        # Ensure there's a value element
+                        value = cell_a2.find(".//ns:v", namespaces)
+                        if value is None:
+                            value = ET.SubElement(cell_a2, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v")
+                        value.text = "0"
+                        
+                        LOGGER.info(f"Updated SORT formula: {sort_formula}")
+                    
+                    # Save the modified sheet XML
+                    tree.write(sheet_xml_path, encoding="UTF-8", xml_declaration=True)
+                    LOGGER.info(f"Saved modifications to {sheet_xml_path}")
+                    
+                except Exception as e:
+                    LOGGER.error(f"Error processing sheet {sheet_name}: {e}")
+                    raise
+            
+            # Create the final file path
+            final_path = wip_path.replace("_wip.xlsx", "_final.xlsx")
+            LOGGER.info(f"Creating final Excel file: {final_path}")
+            
+            # Create the new zip file (Excel file)
+            with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zip_out:
+                for root_dir, _, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root_dir, file)
+                        arcname = os.path.relpath(file_path, temp_dir)
+                        zip_out.write(file_path, arcname)
+            
+            LOGGER.info(f"Successfully created final Excel file: {final_path}")
+            return final_path
+            
+        except Exception as e:
+            LOGGER.error(f"Error in fix method: {e}")
+            raise
+        finally:
+            # Clean up temporary directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                LOGGER.info(f"Cleaned up temporary directory: {temp_dir}")

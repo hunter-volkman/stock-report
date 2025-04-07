@@ -53,7 +53,7 @@ class EmailWorkbooks(Sensor, EasyResource):
             except ValueError:
                 raise Exception(f"Invalid process_time '{process_time}': must be in 'HH:MM' format")
 
-        # Validate new weekday/weekend export times
+        # Validate time settings
         for time_attribute in ["export_start_time_weekday", "export_end_time_weekday",
                          "export_start_time_weekend", "export_end_time_weekend"]:
             if time_attribute in attributes:
@@ -181,8 +181,6 @@ class EmailWorkbooks(Sensor, EasyResource):
         LOGGER.info(f"Reconfigured {self.name} with save_dir: {self.save_dir}, recipients: {self.recipients}, "
                    f"location: {self.location}, process_time: {self.process_time}, send_time: {self.send_time}")
         
-        # Add metadata to this part (your comment preserved)
-        
         if self.loop_task:
             self.loop_task.cancel()
         self.loop_task = asyncio.create_task(self.run_scheduled_loop())
@@ -256,16 +254,14 @@ class EmailWorkbooks(Sensor, EasyResource):
 
     async def process_workbook(self, timestamp, date_str):
         """
-        Process the workbook for the data from the specified date.
+        Process the workbook for the data from the specified date, creating both a WIP and final file.
         
         Args:
             timestamp: Datetime object representing the processing time
             date_str: String representing the date to process (YYYYMMDD)
         """
-        # Parse the target date from date_str (this is the day we want data for)
         try:
             target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
-            # Add timezone info
             target_date = target_date.replace(tzinfo=tz.gettz(self.timezone))
             LOGGER.info(f"Processing data for target date: {target_date.strftime('%Y-%m-%d')}")
         except Exception as e:
@@ -273,31 +269,39 @@ class EmailWorkbooks(Sensor, EasyResource):
             self.workbook = f"error: invalid date format {date_str}"
             return None
             
-        # Use weekday or weekend template based on the target date
-        template_name = "template_weekday.xlsx" if target_date.weekday() < 5 else "template_weekend.xlsx"
-        master_template = os.path.join(self.save_dir, template_name)
+        # Use a single template file regardless of weekday/weekend
+        template_path = os.path.join(self.save_dir, "template.xlsx")
         
-        if not os.path.exists(master_template):
-            LOGGER.error(f"Master template {master_template} not found")
+        if not os.path.exists(template_path):
+            LOGGER.error(f"Template file not found: {template_path}")
             self.workbook = "error: missing template"
             return None
 
         try:
-            LOGGER.info(f"Processing workbook using template {master_template} for date {target_date.strftime('%Y-%m-%d')}")
+            LOGGER.info(f"Processing workbook using template {template_path} for date {target_date.strftime('%Y-%m-%d')}")
             
-            # Delegate processing to the WorkbookProcessor
-            workbook_path = self.processor.process(target_date)
+            # Step 1: Process to create WIP file
+            wip_path, num_data_rows = self.processor.process(target_date)
+            LOGGER.info(f"Intermediate WIP file created: {wip_path}")
             
-            self.data = workbook_path
+            # Step 2: Fix the WIP file to create final file
+            final_path = self.processor.fix(wip_path, num_data_rows)
+            LOGGER.info(f"Final file created: {final_path}")
+            
+            self.data = final_path  # Use the final file for emailing
             self.last_processed_date = date_str
             self.last_processed_time = str(timestamp)
             self.workbook = "processed"
             self._save_state()
-            LOGGER.info(f"Successfully processed workbook for {date_str}, saved at {workbook_path}")
-            return workbook_path
+            LOGGER.info(f"Successfully processed workbook for {date_str}, final file at {final_path}")
+            return final_path
         except Exception as e:
             self.workbook = f"error: {str(e)}"
             LOGGER.error(f"Failed to process workbook for {date_str}: {e}")
+            # Only set self.data if we have a successful WIP file, but not a tuple
+            if 'wip_path' in locals():
+                self.data = wip_path
+            self._save_state()
             return None
 
     async def send_processed_workbook(self, timestamp, date_str):
@@ -381,8 +385,11 @@ class EmailWorkbooks(Sensor, EasyResource):
             day = command.get("day", datetime.datetime.now().strftime("%Y%m%d"))
             try:
                 timestamp = datetime.datetime.strptime(day, "%Y%m%d")
-                await self.process_workbook(timestamp, day)
-                return {"status": f"Processed workbook for {day}"}
+                final_path = await self.process_workbook(timestamp, day)
+                if final_path:
+                    return {"status": f"Processed workbook for {day}, saved at {final_path}"}
+                else:
+                    return {"status": f"Failed to process workbook for {day}"}
             except ValueError:
                 return {"status": f"Invalid day format: {day}, use YYYYMMDD"}
             except Exception as e:
