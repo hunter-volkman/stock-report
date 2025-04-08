@@ -1,7 +1,7 @@
 import asyncio
 from viam.module.module import Module
 from viam.components.sensor import Sensor
-from src.email_workbooks import EmailWorkbooks
+from .report import WorkbookReportEmail
 
 async def main():
     module = Module.from_args()
