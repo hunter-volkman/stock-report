@@ -5,3 +5,5 @@ python-dateutil==2.8.2
 fasteners
 numpy>=1.20.0
 pandas==2.1.4
+sendgrid==6.9.7
+pytz
