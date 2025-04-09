@@ -45,7 +45,7 @@ class DataExporter:
             ),
             auth_entity=self.api_key_id
         )
-        client = await ViamClient.create_from_dialog_options(dial_options)
+        client = await ViamClient.create_from_dial_options(dial_options)
         return client
     
     async def export_to_excel(self, 
