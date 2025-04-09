@@ -37,7 +37,7 @@ class DataExporter:
         
     async def connect(self):
         """Connect to the Viam API."""
-        LOGGER.info("[DataExporter] Connecting to Viam API")
+        LOGGER.info("Connecting to Viam API")
         dial_options = DialOptions(
             credentials=Credentials(
                 type="api-key",
@@ -73,7 +73,7 @@ class DataExporter:
         Returns:
             Path to the created Excel file
         """
-        LOGGER.info(f"[DataExporter] Exporting data from {start_time} to {end_time}")
+        LOGGER.info(f"Exporting data from {start_time} to {end_time}")
         
         # Parse bucket_period if it's a string
         if isinstance(bucket_period, str):
@@ -81,7 +81,7 @@ class DataExporter:
                 from isodate import parse_duration
                 bucket_period = parse_duration(bucket_period)
             except ImportError:
-                LOGGER.warning("[DataExporter] isodate package not available, using default bucket period")
+                LOGGER.warning("isodate package not available, using default bucket period")
                 bucket_period = timedelta(minutes=5)
             
         # Connect to Viam API
@@ -110,14 +110,14 @@ class DataExporter:
             limit = 1000
             
             while True:
-                LOGGER.info(f"[DataExporter] Retrieving data from {skip} to {skip + limit}")
+                LOGGER.info(f"Retrieving data from {skip} to {skip + limit}")
                 
                 # Clone the pipeline and add pagination
                 batch_pipeline = pipeline.copy()
                 batch_pipeline.append({"$skip": skip})
                 batch_pipeline.append({"$limit": limit})
                 
-                LOGGER.debug(f"[DataExporter] Executing pipeline: {batch_pipeline}")
+                LOGGER.debug(f"Executing pipeline: {batch_pipeline}")
                 batch = await data_client.tabular_data_by_mql(organization_id=self.org_id, query=batch_pipeline)
                 
                 batch_len = len(batch)
@@ -125,7 +125,7 @@ class DataExporter:
                     break
                     
                 all_data.extend(batch)
-                LOGGER.info(f"[DataExporter] Retrieved {batch_len} records")
+                LOGGER.info(f"Retrieved {batch_len} records")
                 
                 if batch_len < limit:  # Less than limit means we've reached the end
                     break
@@ -164,11 +164,11 @@ class DataExporter:
                                 value = row["data"]["readings"][key]
                                 ws.cell(row=row_idx, column=col_idx, value=value)
                         except Exception as e:
-                            LOGGER.warning(f"[DataExporter] Error writing value for key {key}: {e}")
+                            LOGGER.warning(f"Error writing value for key {key}: {e}")
             
             # Save workbook
             wb.save(output_file)
-            LOGGER.info(f"[DataExporter] Saved data to {output_file} with {len(all_data)} rows")
+            LOGGER.info(f"Saved data to {output_file} with {len(all_data)} rows")
             
             return output_file
             
@@ -194,7 +194,7 @@ class DataExporter:
         Returns:
             List of aggregated data points
         """
-        LOGGER.info(f"[DataExporter] Bucketing data with period {bucket_period} using method {bucket_method}")
+        LOGGER.info(f"Bucketing data with period {bucket_period} using method {bucket_method}")
         
         include_regex = None
         if include_keys_regex:
@@ -219,7 +219,7 @@ class DataExporter:
                     
                 bucketed_data[bucket][key].append(value)
         
-        LOGGER.debug(f"[DataExporter] Created {len(bucketed_data)} time buckets")
+        LOGGER.debug(f"Created {len(bucketed_data)} time buckets")
         
         # Aggregate data in each bucket
         aggregated_data = []
@@ -242,7 +242,7 @@ class DataExporter:
                 elif bucket_method == "pct99":
                     aggregated_reading[key] = np.percentile(values, 99)
                 else:
-                    LOGGER.warning(f"[DataExporter] Unsupported bucket method: {bucket_method}, using max")
+                    LOGGER.warning(f"Unsupported bucket method: {bucket_method}, using max")
                     aggregated_reading[key] = max(values)
             
             aggregated_data.append({
