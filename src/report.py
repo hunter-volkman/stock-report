@@ -28,17 +28,17 @@ from .export import DataExporter
 
 LOGGER = getLogger(__name__)
 
-class WorkbookReportEmail(Sensor):
+class StockReportEmail(Sensor):
     """
-    WorkbookReportEmail component that generates and emails Excel workbook reports
+    StockReportEmail component that generates and emails Excel workbook reports
     based on scheduled times from Viam API data.
     """
     
     MODEL = Model(ModelFamily("hunter", "stock-report"), "email")
     
     @classmethod
-    def new(cls, config: ComponentConfig, dependencies: Mapping[str, ResourceBase]) -> "WorkbookReportEmail":
-        """Create a new WorkbookReportEmail instance."""
+    def new(cls, config: ComponentConfig, dependencies: Mapping[str, ResourceBase]) -> "StockReportEmail":
+        """Create a new StockReportEmail instance."""
         instance = cls(config.name)
         instance.reconfigure(config, dependencies)
         return instance
@@ -49,7 +49,7 @@ class WorkbookReportEmail(Sensor):
         attributes = struct_to_dict(config.attributes)
         
         # Check required attributes
-        required = ["location", "recipients", "api_key_id", "api_key", "org_id", "sendgrid_api_key"]
+        required = ["location", "recipients", "api_key_id", "api_key", "org_id", "sendgrid_api_key", "filename_prefix"]
         for attr in required:
             if attr not in attributes:
                 raise ValueError(f"{attr} is required")
@@ -94,6 +94,7 @@ class WorkbookReportEmail(Sensor):
         
         # Base configuration
         self.location = ""
+        self.filename_prefix = ""
         
         # Email configuration
         self.sendgrid_api_key = ""
@@ -136,6 +137,7 @@ class WorkbookReportEmail(Sensor):
         self.state_dir = os.path.join(os.path.expanduser("~"), ".stock-report")
         self.state_file = os.path.join(self.state_dir, f"{name}.json")
         self.workbooks_dir = os.path.join(self.state_dir, "workbooks")
+        self.lock_file = f"{self.state_file}.lock"
         
         # Create necessary directories
         os.makedirs(self.state_dir, exist_ok=True)
@@ -143,13 +145,13 @@ class WorkbookReportEmail(Sensor):
         
         # Load persisted state
         self._load_state()
-        LOGGER.info(f"[WorkbookReportEmail:{name}] Initialized with PID: {os.getpid()}")
+        LOGGER.info(f"Initialized with PID: {os.getpid()}")
     
     def _load_state(self):
         """Load persistent state from file with locking."""
         if os.path.exists(self.state_file):
             # Use a file lock to ensure safe reads
-            lock = fasteners.InterProcessLock(f"{self.state_file}.lock")
+            lock = fasteners.InterProcessLock(self.lock_file)
             
             try:
                 # Acquire the lock with a timeout
@@ -178,7 +180,7 @@ class WorkbookReportEmail(Sensor):
     def _save_state(self):
         """Save state to file for persistence across restarts using file locking."""
         # Use a file lock to ensure safe writes
-        lock = fasteners.InterProcessLock(f"{self.state_file}.lock")
+        lock = fasteners.InterProcessLock(self.lock_file)
         
         try:
             # Acquire the lock with a timeout
@@ -221,6 +223,7 @@ class WorkbookReportEmail(Sensor):
         
         # Configure from attributes
         self.location = config.attributes.fields["location"].string_value
+        self.filename_prefix = attributes.get("filename_prefix", "")
         
         # Email configuration
         self.sender_email = attributes.get("sender_email", "no-reply@viam.com")
@@ -234,7 +237,7 @@ class WorkbookReportEmail(Sensor):
         elif isinstance(recipients, str):
             self.recipients = [r.strip() for r in recipients.split(",")]
         else:
-            LOGGER.warning(f"[WorkbookReportEmail:{self.name}] Unexpected recipients format: {type(recipients)}")
+            LOGGER.warning(f"Unexpected recipients format: {type(recipients)}")
             self.recipients = [str(recipients)]
         
         # API configuration
@@ -302,11 +305,11 @@ class WorkbookReportEmail(Sensor):
         """Run a scheduled loop that wakes up for processing and sending times."""
         lock = fasteners.InterProcessLock(self.lock_file)
         if not lock.acquire(blocking=False):
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Another instance running, exiting (PID {os.getpid()})")
+            LOGGER.info(f"Another instance running, exiting (PID {os.getpid()})")
             return
             
         try:
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Started scheduled loop with PID {os.getpid()}")
+            LOGGER.info(f"Started scheduled loop with PID {os.getpid()}")
             
             while True:
                 now = datetime.datetime.now()
@@ -321,7 +324,7 @@ class WorkbookReportEmail(Sensor):
                 sleep_seconds = min(sleep_until_process, sleep_until_send)
                 
                 next_event = "process" if sleep_until_process < sleep_until_send else "send"
-                LOGGER.info(f"[WorkbookReportEmail:{self.name}] Sleeping for {sleep_seconds:.0f} seconds until {next_event} at "
+                LOGGER.info(f"Sleeping for {sleep_seconds:.0f} seconds until {next_event} at "
                           f"{next_process if next_event == 'process' else next_send}")
                 
                 await asyncio.sleep(sleep_seconds)
@@ -345,13 +348,13 @@ class WorkbookReportEmail(Sensor):
                     await self.send_processed_workbook(now, today_str)
                 
         except asyncio.CancelledError:
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Scheduled loop cancelled")
+            LOGGER.info("Scheduled loop cancelled")
             raise
         except Exception as e:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Scheduled loop failed: {e}")
+            LOGGER.error(f"Scheduled loop failed: {e}")
         finally:
             lock.release()
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Released lock, loop exiting (PID {os.getpid()})")
+            LOGGER.info(f"Released lock, loop exiting (PID {os.getpid()})")
     
     async def process_workbook(self, timestamp, date_str):
         """
@@ -365,7 +368,7 @@ class WorkbookReportEmail(Sensor):
             # Parse target date
             target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
             target_date = target_date.replace(tzinfo=tz.gettz(self.timezone))
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Processing data for target date: {target_date.strftime('%Y-%m-%d')}")
+            LOGGER.info(f"Processing data for target date: {target_date.strftime('%Y-%m-%d')}")
             
             # Define file paths
             template_path = os.path.join(self.workbooks_dir, "template.xlsx")
@@ -373,7 +376,7 @@ class WorkbookReportEmail(Sensor):
             
             # Verify template exists
             if not os.path.exists(template_path):
-                LOGGER.error(f"[WorkbookReportEmail:{self.name}] Template file not found: {template_path}")
+                LOGGER.error(f"Template file not found: {template_path}")
                 self.workbook = "error: missing template"
                 self._save_state()
                 return None
@@ -388,7 +391,7 @@ class WorkbookReportEmail(Sensor):
             start_time = target_date.replace(hour=open_hour, minute=open_minute, second=0, microsecond=0)
             end_time = target_date.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
             
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Exporting data from {start_time} to {end_time}")
+            LOGGER.info(f"Exporting data from {start_time} to {end_time}")
             
             # Export raw data
             exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.timezone)
@@ -403,21 +406,31 @@ class WorkbookReportEmail(Sensor):
                 tab_name="RAW"
             )
             
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Raw data exported to {raw_data_path}")
+            LOGGER.info(f"Raw data exported to {raw_data_path}")
             
-            # Create report from the raw data
-            wip_file = os.path.join(self.workbooks_dir, f"3895th_{target_date.strftime('%m%d%y')}_wip.xlsx")
+            # Create WIP file with new naming convention
+            wip_filename = f"{self.filename_prefix}_wip_{target_date.strftime('%Y%m%d')}.xlsx"
+            wip_path = os.path.join(self.workbooks_dir, wip_filename)
+            
+            # Create final filename with new convention
+            final_filename = f"{self.filename_prefix}_{target_date.strftime('%Y%m%d')}.xlsx"
+            final_path = os.path.join(self.workbooks_dir, final_filename)
             
             # Copy template to WIP file
-            shutil.copy(template_path, wip_file)
+            shutil.copy(template_path, wip_path)
             
             # Process the raw data and update the workbook
-            num_data_rows = self._update_raw_import_sheet(raw_data_path, wip_file)
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Updated Raw Import sheet with {num_data_rows} rows")
+            num_data_rows = self._update_raw_import_sheet(raw_data_path, wip_path)
+            LOGGER.info(f"Updated Raw Import sheet with {num_data_rows} rows")
             
             # Fix the workbook
-            final_path = self._fix_workbook(wip_file, num_data_rows)
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Created final report: {final_path}")
+            self._fix_workbook(wip_path, num_data_rows, final_path)
+            LOGGER.info(f"Created final report: {final_path}")
+            
+            # Clean up WIP file
+            if os.path.exists(wip_path):
+                os.remove(wip_path)
+                LOGGER.info(f"Removed temporary WIP file: {wip_path}")
             
             # Update state
             self.data = final_path
@@ -429,7 +442,7 @@ class WorkbookReportEmail(Sensor):
             return final_path
             
         except Exception as e:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Failed to process workbook: {e}")
+            LOGGER.error(f"Failed to process workbook: {e}")
             self.workbook = f"error: {str(e)}"
             self._save_state()
             return None
@@ -468,11 +481,11 @@ class WorkbookReportEmail(Sensor):
         """
         try:
             # Load data from raw export file
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Loading raw data from {raw_file}")
+            LOGGER.info(f"Loading raw data from {raw_file}")
             raw_wb = openpyxl.load_workbook(raw_file, data_only=True)
             
             if "RAW" not in raw_wb.sheetnames:
-                LOGGER.error(f"[WorkbookReportEmail:{self.name}] RAW sheet not found in exported data")
+                LOGGER.error(f"RAW sheet not found in exported data")
                 raise ValueError("RAW sheet not found in exported data")
                 
             raw_sheet = raw_wb["RAW"]
@@ -480,39 +493,39 @@ class WorkbookReportEmail(Sensor):
             # Get data from raw sheet
             data_rows = list(raw_sheet.iter_rows(min_row=2, values_only=True))
             
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Loaded {len(data_rows)} rows of data from raw export")
+            LOGGER.info(f"Loaded {len(data_rows)} rows of data from raw export")
             
             # Open the output workbook
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Opening output workbook: {output_file}")
+            LOGGER.info(f"Opening output workbook: {output_file}")
             output_wb = openpyxl.load_workbook(output_file)
             
             if "Raw Import" not in output_wb.sheetnames:
-                LOGGER.error(f"[WorkbookReportEmail:{self.name}] Raw Import sheet not found in template")
+                LOGGER.error(f"Raw Import sheet not found in template")
                 raise ValueError("Raw Import sheet not found in template")
                 
             output_sheet = output_wb["Raw Import"]
             
             # Clear existing data from Raw Import sheet (keeping headers)
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Clearing existing data from Raw Import sheet")
+            LOGGER.info("Clearing existing data from Raw Import sheet")
             for row in output_sheet.iter_rows(min_row=2):
                 for cell in row:
                     cell.value = None
             
             # Copy data to Raw Import sheet
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Copying data to Raw Import sheet")
+            LOGGER.info("Copying data to Raw Import sheet")
             for r_idx, row_data in enumerate(data_rows, start=2):
                 for c_idx, value in enumerate(row_data, start=1):
                     output_sheet.cell(row=r_idx, column=c_idx).value = value
             
             # Save the workbook
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Saving updated workbook to {output_file}")
+            LOGGER.info(f"Saving updated workbook to {output_file}")
             output_wb.save(output_file)
             
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Raw Import sheet updated with {len(data_rows)} rows of data")
+            LOGGER.info(f"Raw Import sheet updated with {len(data_rows)} rows of data")
             return len(data_rows)
             
         except Exception as e:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Error updating Raw Import sheet: {e}")
+            LOGGER.error(f"Error updating Raw Import sheet: {e}")
             raise
     
     def _get_sheet_mappings(self, excel_path):
@@ -569,24 +582,25 @@ class WorkbookReportEmail(Sensor):
                     sheet_name = sheet_rel_map[rel_id]
                     sheet_mapping[sheet_name] = os.path.basename(target)
 
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Sheet mappings: {sheet_mapping}")
+            LOGGER.info(f"Sheet mappings: {sheet_mapping}")
             return sheet_mapping
             
         except Exception as e:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Error extracting sheet mappings: {e}")
+            LOGGER.error(f"Error extracting sheet mappings: {e}")
             raise
         finally:
             # Clean up temporary directory
             if os.path.exists(temp_dir) and "temp_excel" not in excel_path:
                 shutil.rmtree(temp_dir)
     
-    def _fix_workbook(self, wip_path, num_data_rows):
+    def _fix_workbook(self, wip_path, num_data_rows, final_path):
         """
         Fix the workbook structure to handle row counts and formulas.
         
         Args:
             wip_path: Path to the WIP workbook
             num_data_rows: Number of data rows
+            final_path: Path to save the final workbook
             
         Returns:
             Path to the fixed workbook
@@ -598,22 +612,22 @@ class WorkbookReportEmail(Sensor):
         try:
             # Ensure WIP file exists
             if not os.path.exists(wip_path):
-                LOGGER.error(f"[WorkbookReportEmail:{self.name}] WIP file not found: {wip_path}")
+                LOGGER.error(f"WIP file not found: {wip_path}")
                 raise FileNotFoundError(f"WIP file not found: {wip_path}")
 
             # Create a fresh temp directory
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
             os.makedirs(temp_dir, exist_ok=True)
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Created temp directory: {temp_dir}")
+            LOGGER.info(f"Created temp directory: {temp_dir}")
             
             # Extract the Excel file
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Extracting WIP Excel file: {wip_path}")
+            LOGGER.info(f"Extracting WIP Excel file: {wip_path}")
             with zipfile.ZipFile(wip_path, "r") as zip_ref:
                 zip_ref.extractall(temp_dir)
             
             # Get sheet mappings
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Obtaining sheet mappings")
+            LOGGER.info("Obtaining sheet mappings")
             sheet_mappings = self._get_sheet_mappings(wip_path)
             
             # Define namespaces
@@ -631,7 +645,7 @@ class WorkbookReportEmail(Sensor):
             # Path to worksheets directory
             worksheets_dir = os.path.join(temp_dir, "xl", "worksheets")
             if not os.path.exists(worksheets_dir):
-                LOGGER.error(f"[WorkbookReportEmail:{self.name}] Worksheets directory not found: {worksheets_dir}")
+                LOGGER.error(f"Worksheets directory not found: {worksheets_dir}")
                 raise FileNotFoundError(f"Worksheets directory not found: {worksheets_dir}")
             
             # Process each sheet that needs fixing
@@ -639,15 +653,15 @@ class WorkbookReportEmail(Sensor):
             
             for sheet_name in sheets_to_process:
                 if sheet_name not in sheet_mappings:
-                    LOGGER.warning(f"[WorkbookReportEmail:{self.name}] Sheet '{sheet_name}' not found in workbook. Skipping...")
+                    LOGGER.warning(f"Sheet '{sheet_name}' not found in workbook. Skipping...")
                     continue
                 
                 sheet_xml_path = os.path.join(worksheets_dir, sheet_mappings[sheet_name])
                 if not os.path.exists(sheet_xml_path):
-                    LOGGER.error(f"[WorkbookReportEmail:{self.name}] Sheet XML file not found: {sheet_xml_path}")
+                    LOGGER.error(f"Sheet XML file not found: {sheet_xml_path}")
                     continue
                 
-                LOGGER.info(f"[WorkbookReportEmail:{self.name}] Processing sheet: {sheet_name}")
+                LOGGER.info(f"Processing sheet: {sheet_name}")
                 
                 # Parse sheet XML
                 try:
@@ -657,7 +671,7 @@ class WorkbookReportEmail(Sensor):
                     # Find sheetData element
                     sheet_data = root.find(".//ns:sheetData", namespaces)
                     if sheet_data is None:
-                        LOGGER.warning(f"[WorkbookReportEmail:{self.name}] No sheetData found in {sheet_name}, skipping modifications")
+                        LOGGER.warning(f"No sheetData found in {sheet_name}, skipping modifications")
                         continue
                     
                     # Remove excess rows
@@ -666,24 +680,27 @@ class WorkbookReportEmail(Sensor):
                         row_number = int(row.attrib.get("r", "0"))
                         if row_number > num_data_rows + 1:  # +1 for header row
                             rows_to_remove.append(row)
-                    
-                    for row in rows_to_remove:
-                        sheet_data.remove(row)
-                        LOGGER.info(f"[WorkbookReportEmail:{self.name}] Removed excess row {row.attrib.get('r')} from {sheet_name}")
+
+                    # Remove excess rows
+                    if rows_to_remove:
+                        first_row = rows_to_remove[0].attrib.get('r') if rows_to_remove else "N/A"
+                        last_row = rows_to_remove[-1].attrib.get('r') if rows_to_remove else "N/A"
+                        
+                        for row in rows_to_remove:
+                            sheet_data.remove(row)
+        
+                        LOGGER.info(f"Removed {len(rows_to_remove)} excess rows ({first_row} to {last_row}) from {sheet_name}")
                     
                     # Save the modified sheet XML
                     tree.write(sheet_xml_path, encoding="UTF-8", xml_declaration=True)
-                    LOGGER.info(f"[WorkbookReportEmail:{self.name}] Saved modifications to {sheet_xml_path}")
+                    LOGGER.info(f"Saved modifications to {sheet_xml_path}")
                     
                 except Exception as e:
-                    LOGGER.error(f"[WorkbookReportEmail:{self.name}] Error processing sheet {sheet_name}: {e}")
+                    LOGGER.error(f"Error processing sheet {sheet_name}: {e}")
                     raise
             
-            # Create the final file path
-            final_path = wip_path.replace("_wip.xlsx", "_final.xlsx")
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Creating final Excel file: {final_path}")
-            
-            # Create the new zip file (Excel file)
+            # Create the final zip file (Excel file)
+            LOGGER.info(f"Creating final Excel file: {final_path}")
             with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zip_out:
                 for root_dir, _, files in os.walk(temp_dir):
                     for file in files:
@@ -691,22 +708,22 @@ class WorkbookReportEmail(Sensor):
                         arcname = os.path.relpath(file_path, temp_dir)
                         zip_out.write(file_path, arcname)
             
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Successfully created final Excel file: {final_path}")
+            LOGGER.info(f"Successfully created final Excel file: {final_path}")
             return final_path
             
         except Exception as e:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Error in fix_workbook method: {e}")
+            LOGGER.error(f"Error in fix_workbook method: {e}")
             raise
         finally:
             # Clean up temporary directory
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
-                LOGGER.info(f"[WorkbookReportEmail:{self.name}] Cleaned up temporary directory: {temp_dir}")
+                LOGGER.info(f"Cleaned up temporary directory: {temp_dir}")
     
     async def send_processed_workbook(self, timestamp, date_str):
         """Send the previously processed workbook via email."""
         if not self.data or not os.path.exists(self.data):
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] No processed workbook available to send")
+            LOGGER.error("No processed workbook available to send")
             self.report = "error: no processed workbook"
             self._save_state()
             return
@@ -717,10 +734,10 @@ class WorkbookReportEmail(Sensor):
             self.last_sent_time = str(timestamp)
             self.report = "sent"
             self._save_state()
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Sent processed workbook for {date_str}")
+            LOGGER.info(f"Sent processed workbook for {date_str}")
         except Exception as e:
             self.report = f"error: {str(e)}"
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Failed to send workbook for {date_str}: {e}")
+            LOGGER.error(f"Failed to send workbook for {date_str}: {e}")
     
     async def process_and_send(self, timestamp, date_str):
         """Process and send the workbook immediately."""
@@ -732,14 +749,14 @@ class WorkbookReportEmail(Sensor):
                 self.last_sent_time = str(timestamp)
                 self.report = "sent"
                 self._save_state()
-                LOGGER.info(f"[WorkbookReportEmail:{self.name}] Processed and sent workbook for {date_str}")
+                LOGGER.info(f"Processed and sent workbook for {date_str}")
                 return {"status": "success", "message": f"Processed and sent workbook for {date_str}"}
             else:
                 self.report = "error: processing failed"
                 return {"status": "error", "message": "Processing failed"}
         except Exception as e:
             self.report = f"error: {str(e)}"
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Failed to process/send for {date_str}: {e}")
+            LOGGER.error(f"Failed to process/send for {date_str}: {e}")
             return {"status": "error", "message": str(e)}
     
     async def send_workbook(self, workbook_path, timestamp):
@@ -751,18 +768,19 @@ class WorkbookReportEmail(Sensor):
             timestamp: Datetime object representing the send time
         """
         if not self.sendgrid_api_key:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] No SendGrid API key configured")
+            LOGGER.error("No SendGrid API key configured")
             raise ValueError("No SendGrid API key configured")
         
         if not os.path.exists(workbook_path):
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Workbook file not found: {workbook_path}")
+            LOGGER.error(f"Workbook file not found: {workbook_path}")
             raise FileNotFoundError(f"Workbook file not found: {workbook_path}")
         
         try:
             # Prepare email content
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Preparing email with workbook: {os.path.basename(workbook_path)}")
+            LOGGER.info(f"Preparing email with workbook: {os.path.basename(workbook_path)}")
             
-            subject = f"Daily Fill Report - {self.location} - {timestamp.strftime('%Y-%m-%d')}"
+            # Updated email subject format
+            subject = f"Daily Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
             body_text = f"Attached is the daily langer fill report for {self.location} generated on {timestamp.strftime('%Y-%m-%d')}."
             
             # Create email message
@@ -798,15 +816,15 @@ class WorkbookReportEmail(Sensor):
             message.add_attachment(attachment)
             
             # Send email
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Sending email to {len(self.recipients)} recipients")
+            LOGGER.info(f"Sending email to {len(self.recipients)} recipients")
             sg = SendGridAPIClient(self.sendgrid_api_key)
             response = sg.send(message)
             
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] Email sent via SendGrid API. Status code: {response.status_code}")
+            LOGGER.info(f"Email sent via SendGrid API. Status code: {response.status_code}")
             return True
             
         except Exception as e:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Failed to send email: {e}")
+            LOGGER.error(f"Failed to send email: {e}")
             raise
     
     async def get_readings(self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs) -> Dict[str, SensorReading]:
@@ -872,9 +890,9 @@ class WorkbookReportEmail(Sensor):
                     return {"status": "error", "message": "No SendGrid API key configured"}
                     
                 # Create test email content
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                subject = f"Test Email from {self.location}"
-                body = f"This is a test email from {self.name} at {self.location}.\nTime: {timestamp}"
+                timestamp = datetime.datetime.now()
+                subject = f"Test Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
+                body = f"This is a test email from {self.name} at {self.location}.\nTime: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 # Create email message
                 message = Mail(
