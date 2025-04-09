@@ -95,6 +95,7 @@ class StockReportEmail(Sensor):
         # Base configuration
         self.location = ""
         self.filename_prefix = ""
+        self.teleop_url = ""
         
         # Email configuration
         self.sendgrid_api_key = ""
@@ -224,6 +225,7 @@ class StockReportEmail(Sensor):
         # Configure from attributes
         self.location = config.attributes.fields["location"].string_value
         self.filename_prefix = attributes.get("filename_prefix", "")
+        self.teleop_url = attributes.get("teleop_url", "")
         
         # Email configuration
         self.sender_email = attributes.get("sender_email", "no-reply@viam.com")
@@ -781,7 +783,10 @@ class StockReportEmail(Sensor):
             
             # Updated email subject format
             subject = f"Daily Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
-            body_text = f"Attached is the daily langer fill report for {self.location} generated on {timestamp.strftime('%Y-%m-%d')}."
+            
+            # Updated email body with hyperlink to teleop
+            teleop_url = self.teleop_url if hasattr(self, 'teleop_url') and self.teleop_url else "#"
+            body_text = f"See the attached Excel with data for review. Click here for the link to the real-time view of the store: {teleop_url}"
             
             # Create email message
             message = Mail(
@@ -791,12 +796,12 @@ class StockReportEmail(Sensor):
                 plain_text_content=Content("text/plain", body_text)
             )
             
-            # Add HTML version
+            # Add HTML version with hyperlink
             html_content = f"""<html>
-<body>
-<p>{body_text}</p>
-</body>
-</html>"""
+    <body>
+    <p>See the attached Excel with data for review. <a href="{teleop_url}">Click here</a> for the link to the real-time view of the store.</p>
+    </body>
+    </html>"""
             message.add_content(Content("text/html", html_content))
             
             # Add the attachment
@@ -832,20 +837,32 @@ class StockReportEmail(Sensor):
         now = datetime.datetime.now()
         next_process = self._get_next_process_time(now)
         next_send = self._get_next_send_time(now)
+
+        # Map store hours for display
+        store_hours = {
+            "monday": self.hours_mon,
+            "tuesday": self.hours_tue,
+            "wednesday": self.hours_wed,
+            "thursday": self.hours_thu,
+            "friday": self.hours_fri,
+            "saturday": self.hours_sat,
+            "sunday": self.hours_sun
+        }
         
         return {
-            "status": "running",
             "last_processed_date": self.last_processed_date or "never",
             "last_processed_time": self.last_processed_time or "never",
             "last_sent_date": self.last_sent_date or "never",
             "last_sent_time": self.last_sent_time or "never",
+            "last_workbook_path": self.data or "none",
             "next_process_date": next_process.strftime("%Y%m%d"),
             "next_process_time": str(next_process),
             "next_send_date": next_send.strftime("%Y%m%d"),
             "next_send_time": str(next_send),
-            "report": self.report,
-            "workbook": self.workbook,
-            "data": self.data or "none",
+            "timezone": self.timezone,
+            "filename_prefix": self.filename_prefix,
+            "store_hours": store_hours,
+            "report_status": self.report,
             "pid": os.getpid(),
             "location": self.location
         }
