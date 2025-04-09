@@ -862,7 +862,7 @@ class StockReportEmail(Sensor):
             "timezone": self.timezone,
             "filename_prefix": self.filename_prefix,
             "store_hours": store_hours,
-            "report_status": self.report,
+            "report": self.report,
             "pid": os.getpid(),
             "location": self.location
         }
