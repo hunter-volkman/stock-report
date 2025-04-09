@@ -5,7 +5,7 @@ from .report import WorkbookReportEmail
 
 async def main():
     module = Module.from_args()
-    module.add_model_from_registry(Sensor.API, EmailWorkbooks.MODEL)
+    module.add_model_from_registry(Sensor.API, WorkbookReportEmail.MODEL)
     await module.start()
 
 if __name__ == "__main__":
