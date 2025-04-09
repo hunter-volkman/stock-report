@@ -93,7 +93,6 @@ class WorkbookReportEmail(Sensor):
         self.config = None
         
         # Base configuration
-        self.save_dir = os.path.expanduser("~/workbooks")
         self.location = ""
         
         # Email configuration
@@ -133,12 +132,14 @@ class WorkbookReportEmail(Sensor):
         # Background tasks
         self.loop_task = None
         
-        # Create necessary directories
-        os.makedirs(self.save_dir, exist_ok=True)
+        # State persistence - Similar to stock-alert module
+        self.state_dir = os.path.join(os.path.expanduser("~"), ".stock-report")
+        self.state_file = os.path.join(self.state_dir, f"{name}.json")
+        self.workbooks_dir = os.path.join(self.state_dir, "workbooks")
         
-        # State file for persistent state
-        self.state_file = os.path.join(self.save_dir, f"{name}_state.json")
-        self.lock_file = os.path.join(self.save_dir, f"{name}_lockfile")
+        # Create necessary directories
+        os.makedirs(self.state_dir, exist_ok=True)
+        os.makedirs(self.workbooks_dir, exist_ok=True)
         
         # Load persisted state
         self._load_state()
@@ -148,9 +149,10 @@ class WorkbookReportEmail(Sensor):
         """Load persistent state from file with locking."""
         if os.path.exists(self.state_file):
             # Use a file lock to ensure safe reads
-            lock = fasteners.InterProcessLock(self.lock_file)
+            lock = fasteners.InterProcessLock(f"{self.state_file}.lock")
             
             try:
+                # Acquire the lock with a timeout
                 if lock.acquire(blocking=True, timeout=5):
                     try:
                         with open(self.state_file, "r") as f:
@@ -163,24 +165,23 @@ class WorkbookReportEmail(Sensor):
                             self.report = state.get("report", "not_sent")
                             self.workbook = state.get("workbook", "not_processed")
                         
-                        LOGGER.info(f"[WorkbookReportEmail:{self.name}] Loaded state: " +
-                                   f"last_processed={self.last_processed_date}, " +
-                                   f"last_sent={self.last_sent_date}")
+                        LOGGER.info(f"Loaded state from {self.state_file}")
                     finally:
                         lock.release()
                 else:
-                    LOGGER.warning(f"[WorkbookReportEmail:{self.name}] Could not acquire lock to load state")
+                    LOGGER.warning(f"Could not acquire lock to load state for {self.name}")
             except Exception as e:
-                LOGGER.error(f"[WorkbookReportEmail:{self.name}] Error loading state: {e}")
+                LOGGER.error(f"Error loading state: {e}")
         else:
-            LOGGER.info(f"[WorkbookReportEmail:{self.name}] No state file found, starting fresh")
+            LOGGER.info(f"No state file at {self.state_file}, starting fresh")
     
     def _save_state(self):
-        """Save state to file with locking."""
+        """Save state to file for persistence across restarts using file locking."""
         # Use a file lock to ensure safe writes
-        lock = fasteners.InterProcessLock(self.lock_file)
+        lock = fasteners.InterProcessLock(f"{self.state_file}.lock")
         
         try:
+            # Acquire the lock with a timeout
             if lock.acquire(blocking=True, timeout=5):
                 try:
                     state = {
@@ -193,21 +194,21 @@ class WorkbookReportEmail(Sensor):
                         "workbook": self.workbook
                     }
                     
-                    # Write to temp file first
+                    # First write to a temporary file
                     temp_file = f"{self.state_file}.tmp"
                     with open(temp_file, "w") as f:
                         json.dump(state, f)
                     
-                    # Then replace the original atomically
+                    # Then atomically replace the original file
                     os.replace(temp_file, self.state_file)
                     
-                    LOGGER.debug(f"[WorkbookReportEmail:{self.name}] Saved state to {self.state_file}")
+                    LOGGER.debug(f"Saved state to {self.state_file}")
                 finally:
                     lock.release()
             else:
-                LOGGER.warning(f"[WorkbookReportEmail:{self.name}] Could not acquire lock to save state")
+                LOGGER.warning(f"Could not acquire lock to save state for {self.name}")
         except Exception as e:
-            LOGGER.error(f"[WorkbookReportEmail:{self.name}] Error saving state: {e}")
+            LOGGER.error(f"Error saving state: {e}")
     
     def reconfigure(self, config: ComponentConfig, dependencies: Mapping[str, ResourceBase]):
         """Configure the component with updated settings."""
@@ -218,14 +219,13 @@ class WorkbookReportEmail(Sensor):
         # Get configuration attributes
         attributes = struct_to_dict(config.attributes)
         
-        # Configure base settings
-        self.save_dir = attributes.get("save_dir", os.path.expanduser("~/workbooks"))
-        self.location = attributes.get("location", "")
+        # Configure from attributes
+        self.location = config.attributes.fields["location"].string_value
         
         # Email configuration
-        self.sendgrid_api_key = attributes.get("sendgrid_api_key", "")
         self.sender_email = attributes.get("sender_email", "no-reply@viam.com")
         self.sender_name = attributes.get("sender_name", "Workbook Report")
+        self.sendgrid_api_key = attributes.get("sendgrid_api_key", "")
         
         # Handle recipients (string or list)
         recipients = attributes.get("recipients", [])
@@ -265,17 +265,15 @@ class WorkbookReportEmail(Sensor):
         self.hours_sat = attributes.get("hours_sat", ["08:00", "17:00"])
         self.hours_sun = attributes.get("hours_sun", ["08:00", "17:00"])
         
-        # Create directories
-        os.makedirs(self.save_dir, exist_ok=True)
-        
-        # Update state file path if save_dir changed
-        self.state_file = os.path.join(self.save_dir, f"{self.name}_state.json")
-        self.lock_file = os.path.join(self.save_dir, f"{self.name}_lockfile")
-        
         # Log configuration details
-        LOGGER.info(f"[WorkbookReportEmail:{self.name}] Configured for location: {self.location}")
-        LOGGER.info(f"[WorkbookReportEmail:{self.name}] Process time: {self.process_time}, Send time: {self.send_time}")
-        LOGGER.info(f"[WorkbookReportEmail:{self.name}] Recipients: {', '.join(self.recipients)}")
+        LOGGER.info(f"Configured {self.name} for location '{self.location}'")
+        LOGGER.info(f"Process time: {self.process_time}, Send time: {self.send_time}")
+        LOGGER.info(f"Will send reports to: {', '.join(self.recipients)}")
+        
+        if self.sendgrid_api_key:
+            LOGGER.info("SendGrid API key configured")
+        else:
+            LOGGER.warning("No SendGrid API key configured")
         
         # Cancel existing task if any
         if self.loop_task and not self.loop_task.done():
@@ -370,8 +368,8 @@ class WorkbookReportEmail(Sensor):
             LOGGER.info(f"[WorkbookReportEmail:{self.name}] Processing data for target date: {target_date.strftime('%Y-%m-%d')}")
             
             # Define file paths
-            template_path = os.path.join(self.save_dir, "template.xlsx")
-            raw_data_path = os.path.join(self.save_dir, "raw_export.xlsx")
+            template_path = os.path.join(self.workbooks_dir, "template.xlsx")
+            raw_data_path = os.path.join(self.workbooks_dir, "raw_export.xlsx")
             
             # Verify template exists
             if not os.path.exists(template_path):
@@ -408,7 +406,7 @@ class WorkbookReportEmail(Sensor):
             LOGGER.info(f"[WorkbookReportEmail:{self.name}] Raw data exported to {raw_data_path}")
             
             # Create report from the raw data
-            wip_file = os.path.join(self.save_dir, f"3895th_{target_date.strftime('%m%d%y')}_wip.xlsx")
+            wip_file = os.path.join(self.workbooks_dir, f"3895th_{target_date.strftime('%m%d%y')}_wip.xlsx")
             
             # Copy template to WIP file
             shutil.copy(template_path, wip_file)
@@ -527,7 +525,7 @@ class WorkbookReportEmail(Sensor):
         Returns:
             Dictionary mapping sheet names to XML filenames
         """
-        temp_dir = os.path.join(self.save_dir, "temp_excel")
+        temp_dir = os.path.join(self.workbooks_dir, "temp_excel")
         os.makedirs(temp_dir, exist_ok=True)
         
         try:
@@ -595,7 +593,7 @@ class WorkbookReportEmail(Sensor):
         """
         # Create a unique temp directory
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        temp_dir = os.path.join(self.save_dir, f"temp_excel_{timestamp}")
+        temp_dir = os.path.join(self.workbooks_dir, f"temp_excel_{timestamp}")
         
         try:
             # Ensure WIP file exists
