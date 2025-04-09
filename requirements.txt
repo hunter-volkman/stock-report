@@ -7,3 +7,4 @@ numpy>=1.20.0
 pandas==2.1.4
 sendgrid==6.9.7
 pytz
+isodate==0.6.1
