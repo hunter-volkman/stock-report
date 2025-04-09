@@ -31,64 +31,6 @@ if ! python3 -m venv $VENV_NAME >/dev/null 2>&1; then
     fi
 fi
 
-# Check and install LibreOffice with all necessary components for Excel charts
-if ! command -v libreoffice >/dev/null 2>&1; then
-    echo "LibreOffice not found, attempting to install."
-    if command -v apt-get >/dev/null; then
-        echo "Detected Debian/Ubuntu, installing LibreOffice components."
-        SUDO="sudo"
-        if ! command -v $SUDO >/dev/null; then
-            SUDO=""
-        fi
-        # Ensure package list is up-to-date
-        echo "Updating package lists..."
-        $SUDO apt -qq update >/dev/null
-        
-        # Install LibreOffice components silently
-        echo "Installing LibreOffice components..."
-        
-        # Core Calc component
-        $SUDO apt install -qqy libreoffice-calc >/dev/null 2>&1
-        
-        # Additional components for better Excel compatibility
-        $SUDO apt install -qqy libreoffice-base >/dev/null 2>&1
-        
-        # Components for scripting and chart handling
-        $SUDO apt install -qqy libreoffice-script-provider-python python3-uno >/dev/null 2>&1
-        
-        if ! command -v libreoffice >/dev/null 2>&1; then
-            echo $LIBREOFFICE_CALC_ERROR >&2
-            exit 1
-        else
-            echo "LibreOffice components installed successfully."
-            libreoffice --version
-        fi
-    else
-        echo $LIBREOFFICE_CALC_ERROR >&2
-        echo "Please install LibreOffice Calc manually on your system." >&2
-        exit 1
-    fi
-else
-    echo "LibreOffice already installed."
-    
-    # Check for additional required components
-    if ! dpkg -l libreoffice-base >/dev/null 2>&1 || ! dpkg -l libreoffice-script-provider-python >/dev/null 2>&1; then
-        echo "Installing additional LibreOffice components for Excel chart support..."
-        SUDO="sudo"
-        if ! command -v $SUDO >/dev/null; then
-            SUDO=""
-        fi
-        
-        # Update package lists silently
-        $SUDO apt -qq update >/dev/null
-        
-        # Install missing components silently
-        $SUDO apt install -qqy libreoffice-base libreoffice-script-provider-python python3-uno >/dev/null 2>&1
-        
-        echo "Additional LibreOffice components installed."
-    fi
-fi
-
 # Install/upgrade Python packages
 echo "Virtualenv found/created. Installing/upgrading Python packages..."
 if ! [ -f .installed ]; then
