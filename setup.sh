@@ -5,7 +5,6 @@ cd `dirname $0`
 VENV_NAME="venv"
 PYTHON="$VENV_NAME/bin/python"
 ENV_ERROR="This module requires Python >=3.8, pip, and virtualenv to be installed."
-LIBREOFFICE_CALC_ERROR="This module requires LibreOffice Calc for Excel formula recalculation."
 
 # Check and create virtual environment
 if ! python3 -m venv $VENV_NAME >/dev/null 2>&1; then
