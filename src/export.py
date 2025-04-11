@@ -6,6 +6,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from viam.app.viam_client import ViamClient, DataClient
 from viam.rpc.dial import DialOptions, Credentials
+from viam.proto.app.data import Filter, Order
+from google.protobuf.timestamp_pb2 import Timestamp
 from openpyxl import Workbook
 
 LOGGER = logging.getLogger(__name__)
@@ -13,10 +15,10 @@ LOGGER = logging.getLogger(__name__)
 class DataExporter:
     """
     A simplified version of vde.py data exporter, specifically tailored for
-    exporting workbook data from the Viam Data API.
+    exporting workbook data from the Viam Data API, now with image retrieval support.
     """
     
-    def __init__(self, api_key_id, api_key, org_id, timezone="America/New_York"):
+    def __init__(self, api_key_id, api_key, org_id, location_id, timezone="America/New_York"):
         """
         Initialize the data exporter.
         
@@ -24,12 +26,15 @@ class DataExporter:
             api_key_id: Viam API key ID
             api_key: Viam API key
             org_id: Viam organization ID
+            location_id: Viam location ID
             timezone: Timezone for timestamps (default: America/New_York)
         """
         self.api_key_id = api_key_id
         self.api_key = api_key
         self.org_id = org_id
+        self.location_id = location_id  # Add location_id
         self.timezone = self._parse_timezone(timezone)
+        self.data_client = None  # Will be set when connected
         
     def _parse_timezone(self, tz_str):
         """Convert a timezone string to a pytz timezone object."""
@@ -46,6 +51,7 @@ class DataExporter:
             auth_entity=self.api_key_id
         )
         client = await ViamClient.create_from_dial_options(dial_options)
+        self.data_client = client.data_client  # Store data_client for reuse
         return client
     
     async def export_to_excel(self, 
@@ -87,8 +93,6 @@ class DataExporter:
         # Connect to Viam API
         client = await self.connect()
         try:
-            data_client = client.data_client
-            
             # Build the filter pipeline
             match_predicate = {
                 "organization_id": self.org_id,
@@ -118,7 +122,7 @@ class DataExporter:
                 batch_pipeline.append({"$limit": limit})
                 
                 LOGGER.debug(f"Executing pipeline: {batch_pipeline}")
-                batch = await data_client.tabular_data_by_mql(organization_id=self.org_id, query=batch_pipeline)
+                batch = await self.data_client.tabular_data_by_mql(organization_id=self.org_id, query=batch_pipeline)
                 
                 batch_len = len(batch)
                 if batch_len == 0:
@@ -175,6 +179,87 @@ class DataExporter:
         finally:
             client.close()
     
+    async def get_closest_images(self, component_name, start_time, end_time, desired_times):
+        """
+        Retrieve images closest to the specified times from Viam Data Management.
+        
+        Args:
+            component_name: Name of the component (e.g., "ffmpeg")
+            start_time: Start of the time range (datetime with timezone)
+            end_time: End of the time range (datetime with timezone)
+            desired_times: List of datetime objects with timezone for desired image times
+            
+        Returns:
+            List of tuples: [(desired_time, BinaryData or None), ...]
+        """
+        from viam.proto.app.data import CaptureInterval, Order, BinaryID
+
+        # Convert times to UTC for API consistency
+        start_time_utc = start_time.astimezone(pytz.utc)
+        end_time_utc = end_time.astimezone(pytz.utc)
+        desired_times_utc = [dt.astimezone(pytz.utc) for dt in desired_times]
+
+        # Create filter with CaptureInterval for time range
+        start_ts = Timestamp()
+        start_ts.FromDatetime(start_time_utc)
+        end_ts = Timestamp()
+        end_ts.FromDatetime(end_time_utc)
+        capture_interval = CaptureInterval(start=start_ts, end=end_ts)
+        filter = Filter(
+            component_name=component_name,
+            method="ReadImage",
+            interval=capture_interval,
+            organization_ids=[self.org_id]
+        )
+
+        # Query image metadata, sorted by time (ascending)
+        LOGGER.info(f"Querying binary data with filter: component_name={component_name}, method=ReadImage, interval={start_time_utc} to {end_time_utc}, organization_ids={self.org_id}")
+        try:
+            all_images, _, _ = await self.data_client.binary_data_by_filter(
+                filter=filter,
+                include_binary_data=False,
+                sort_order=Order.ORDER_ASCENDING
+            )
+        except Exception as e:
+            LOGGER.error(f"Failed to fetch image metadata: {e}")
+            raise
+
+        if not all_images:
+            LOGGER.warning(f"No images found for {component_name} between {start_time} and {end_time}")
+            return [(dt, None) for dt in desired_times]
+
+        # Find closest image for each desired time
+        closest_ids = []
+        for dt_utc in desired_times_utc:
+            try:
+                closest_image = min(all_images, key=lambda img: abs(img.metadata.time_received.ToDatetime().replace(tzinfo=pytz.utc) - dt_utc))
+                closest_ids.append(closest_image.metadata.id)
+            except Exception as e:
+                LOGGER.error(f"Failed to find closest image for {dt_utc}: {e}")
+                raise
+
+        # Convert string IDs to BinaryID objects with all required fields
+        binary_ids = [BinaryID(
+            file_id=id_str,
+            organization_id=self.org_id,
+            location_id=self.location_id
+        ) for id_str in closest_ids]
+
+        # Retrieve binary data for selected images
+        LOGGER.info(f"Retrieving binary data for {len(binary_ids)} image IDs")
+        try:
+            binary_data_list = await self.data_client.binary_data_by_ids(binary_ids)
+        except Exception as e:
+            LOGGER.error(f"Failed to retrieve binary data: {e}")
+            raise
+
+        id_to_data = {data.metadata.id: data for data in binary_data_list}
+
+        # Map back to desired times with their local representations
+        result = [(desired_times[i], id_to_data.get(closest_ids[i])) for i in range(len(desired_times))]
+        LOGGER.info(f"Retrieved {len([x for _, x in result if x is not None])} images for {len(desired_times)} requested times")
+        return result
+
     def _floor_timestamp(self, ts, bucket_td):
         """Round a timestamp down to the nearest bucket interval."""
         epoch = datetime(1970, 1, 1, tzinfo=ts.tzinfo)

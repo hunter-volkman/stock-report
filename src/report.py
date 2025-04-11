@@ -31,7 +31,7 @@ LOGGER = getLogger(__name__)
 class StockReportEmail(Sensor):
     """
     StockReportEmail component that generates and emails Excel workbook reports
-    based on scheduled times from Viam API data.
+    based on scheduled times from Viam API data, with optional image attachments.
     """
     
     MODEL = Model(ModelFamily("hunter", "stock-report"), "email")
@@ -83,6 +83,17 @@ class StockReportEmail(Sensor):
                     except ValueError:
                         raise ValueError(f"Invalid time format in '{day}': '{time_str}' - must be in 'HH:MM' format")
         
+        # Validate image_times if provided
+        if "image_times" in attributes:
+            image_times = attributes["image_times"]
+            if not isinstance(image_times, list):
+                raise ValueError("'image_times' must be a list")
+            for time_str in image_times:
+                try:
+                    datetime.datetime.strptime(str(time_str), "%H:%M")
+                except ValueError:
+                    raise ValueError(f"Invalid time format in 'image_times': '{time_str}' - must be 'HH:MM'")
+        
         # Return list of required dependencies (none for this component)
         return []
     
@@ -94,6 +105,7 @@ class StockReportEmail(Sensor):
         
         # Base configuration
         self.location = ""
+        self.location_id = ""  # Add location_id
         self.filename_prefix = ""
         self.teleop_url = ""
         
@@ -112,6 +124,7 @@ class StockReportEmail(Sensor):
         self.send_time = "20:00"
         self.process_time = "19:00"  # Default to 1 hour before send
         self.timezone = "America/New_York"
+        self.image_times = []  # List of times for image retrieval
         
         # Store hours
         self.hours_mon = ["07:00", "19:30"]
@@ -224,6 +237,7 @@ class StockReportEmail(Sensor):
         
         # Configure from attributes
         self.location = config.attributes.fields["location"].string_value
+        self.location_id = attributes.get("location_id", "")  # Add location_id from config
         self.filename_prefix = attributes.get("filename_prefix", "")
         self.teleop_url = attributes.get("teleop_url", "")
         
@@ -260,6 +274,7 @@ class StockReportEmail(Sensor):
             self.process_time = process_dt.strftime("%H:%M")
         
         self.timezone = attributes.get("timezone", "America/New_York")
+        self.image_times = attributes.get("image_times", [])
         
         # Configure store hours
         self.hours_mon = attributes.get("hours_mon", ["07:00", "19:30"])
@@ -274,6 +289,8 @@ class StockReportEmail(Sensor):
         LOGGER.info(f"Configured {self.name} for location '{self.location}'")
         LOGGER.info(f"Process time: {self.process_time}, Send time: {self.send_time}")
         LOGGER.info(f"Will send reports to: {', '.join(self.recipients)}")
+        if self.image_times:
+            LOGGER.info(f"Image times configured: {', '.join(self.image_times)}")
         
         if self.sendgrid_api_key:
             LOGGER.info("SendGrid API key configured")
@@ -396,7 +413,8 @@ class StockReportEmail(Sensor):
             LOGGER.info(f"Exporting data from {start_time} to {end_time}")
             
             # Export raw data
-            exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.timezone)
+            # exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.timezone)
+            exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.location_id, self.timezone)
             await exporter.export_to_excel(
                 raw_data_path,
                 "langer_fill",
@@ -763,7 +781,7 @@ class StockReportEmail(Sensor):
     
     async def send_workbook(self, workbook_path, timestamp):
         """
-        Send the workbook report via email using SendGrid.
+        Send the workbook report via email using SendGrid, with optional image attachments.
         
         Args:
             workbook_path: Path to the workbook file
@@ -778,17 +796,11 @@ class StockReportEmail(Sensor):
             raise FileNotFoundError(f"Workbook file not found: {workbook_path}")
         
         try:
-            # Prepare email content
             LOGGER.info(f"Preparing email with workbook: {os.path.basename(workbook_path)}")
-            
-            # Updated email subject format
             subject = f"Daily Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
-            
-            # Updated email body with hyperlink to teleop
             teleop_url = self.teleop_url if hasattr(self, 'teleop_url') and self.teleop_url else "#"
             body_text = f"See the attached Excel with data for review. Click here for the link to the real-time view of the store: {teleop_url}"
             
-            # Create email message
             message = Mail(
                 from_email=Email(self.sender_email, self.sender_name),
                 to_emails=self.recipients,
@@ -796,31 +808,104 @@ class StockReportEmail(Sensor):
                 plain_text_content=Content("text/plain", body_text)
             )
             
-            # Add HTML version with hyperlink
             html_content = f"""<html>
     <body>
     <p>See the attached Excel with data for review. <a href="{teleop_url}">Click here</a> for the link to the real-time view of the store.</p>
     </body>
     </html>"""
+            
+            if self.image_times:
+                target_date = datetime.datetime.strptime(self.last_processed_date, "%Y%m%d").date()
+                local_tz = tz.gettz(self.timezone)
+                desired_times = []
+                for time_str in self.image_times:
+                    hour, minute = map(int, time_str.split(':'))
+                    dt_local = datetime.datetime.combine(target_date, datetime.time(hour, minute), tzinfo=local_tz)
+                    desired_times.append(dt_local)
+
+                opening_time, closing_time = self._get_store_hours_for_date(target_date)
+                open_hour, open_minute = map(int, opening_time.split(':'))
+                close_hour, close_minute = map(int, closing_time.split(':'))
+                start_time = datetime.datetime.combine(target_date, datetime.time(open_hour, open_minute), tzinfo=local_tz)
+                end_time = datetime.datetime.combine(target_date, datetime.time(close_hour, close_minute), tzinfo=local_tz)
+
+                exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.location_id, self.timezone)
+                LOGGER.info("Attempting to connect to Viam API for image retrieval")
+                client = await exporter.connect()
+                if client is None:
+                    LOGGER.error("Failed to connect to Viam API for image retrieval")
+                else:
+                    try:
+                        exporter.data_client = client.data_client
+                        LOGGER.info(f"Fetching images for times: {', '.join(self.image_times)}")
+                        images = await exporter.get_closest_images(
+                            component_name="ffmpeg",
+                            start_time=start_time,
+                            end_time=end_time,
+                            desired_times=desired_times
+                        )
+                        
+                        attached_images = []
+                        images_dir = os.path.join(self.state_dir, "images")
+                        os.makedirs(images_dir, exist_ok=True)  # Ensure images directory exists
+                        
+                        for dt_local, binary_data in images:
+                            if binary_data:
+                                try:
+                                    # Save binary data to a temporary file
+                                    time_str = dt_local.strftime("%H%M")
+                                    temp_image_path = os.path.join(images_dir, f"image_{time_str}.jpg")
+                                    with open(temp_image_path, "wb") as f:
+                                        f.write(binary_data.binary)
+                                    LOGGER.debug(f"Saved image to {temp_image_path}")
+
+                                    # Read and encode the file for attachment
+                                    with open(temp_image_path, "rb") as f:
+                                        file_content = base64.b64encode(f.read()).decode()
+                                    
+                                    filename = f"image_{time_str}.jpg"
+                                    mime_type = "image/jpeg"  # Hardcoded as in send_alert
+                                    attachment = Attachment()
+                                    attachment.file_content = FileContent(file_content)
+                                    attachment.file_name = FileName(filename)
+                                    attachment.file_type = FileType(mime_type)
+                                    attachment.disposition = Disposition("attachment")
+                                    message.add_attachment(attachment)
+                                    attached_images.append(f"{filename} ({dt_local.strftime('%H:%M')})")
+                                    
+                                    # Clean up temporary file
+                                    os.remove(temp_image_path)
+                                    LOGGER.debug(f"Removed temporary image file: {temp_image_path}")
+                                except Exception as e:
+                                    LOGGER.error(f"Error processing image for {dt_local}: {e}")
+                                    continue  # Skip this image, continue with others
+
+                        if attached_images:
+                            images_text = "Attached images:\n" + "\n".join(attached_images)
+                            body_text += "\n\n" + images_text
+                            html_content = html_content.replace("</body>", f"<p>Attached images:<br>{'<br>'.join(attached_images)}</p></body>")
+                    except Exception as e:
+                        LOGGER.error(f"Failed to retrieve or attach images: {e}")
+                    finally:
+                        if client is not None:
+                            LOGGER.info("Closing Viam API client connection")
+                            await client.close()
+                        else:
+                            LOGGER.warning("Client is None, skipping close operation")
+
             message.add_content(Content("text/html", html_content))
             
-            # Add the attachment
             with open(workbook_path, "rb") as f:
                 file_content = base64.b64encode(f.read()).decode()
             
             file_name = os.path.basename(workbook_path)
-            
-            # Create attachment
             attachment = Attachment()
             attachment.file_content = FileContent(file_content)
             attachment.file_name = FileName(file_name)
             attachment.file_type = FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             attachment.disposition = Disposition("attachment")
-            
-            # Add attachment to message
             message.add_attachment(attachment)
             
-            # Send email
             LOGGER.info(f"Sending email to {len(self.recipients)} recipients")
             sg = SendGridAPIClient(self.sendgrid_api_key)
             response = sg.send(message)
@@ -862,6 +947,7 @@ class StockReportEmail(Sensor):
             "timezone": self.timezone,
             "filename_prefix": self.filename_prefix,
             "store_hours": store_hours,
+            "image_times": self.image_times,
             "report": self.report,
             "pid": os.getpid(),
             "location": self.location
@@ -946,7 +1032,8 @@ class StockReportEmail(Sensor):
                 "send_time": self.send_time,
                 "next_process": str(next_process),
                 "next_send": str(next_send),
-                "timezone": self.timezone
+                "timezone": self.timezone,
+                "image_times": self.image_times
             }
             
         else:
