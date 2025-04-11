@@ -1,8 +1,8 @@
 import asyncio
-import os
-import json
 import datetime
-from datetime import timedelta
+import json
+import os
+import base64
 import fasteners
 import shutil
 import zipfile
@@ -17,13 +17,13 @@ from viam.resource.base import ResourceBase
 from viam.resource.types import Model, ModelFamily
 from viam.utils import SensorReading, struct_to_dict
 from viam.logging import getLogger
+from viam.media.video import ViamImage
 from dateutil import tz
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import (
     Mail, Attachment, FileContent, FileName,
     FileType, Disposition, Email, Content
 )
-import base64
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 
@@ -32,11 +32,6 @@ from .export import DataExporter
 LOGGER = getLogger(__name__)
 
 class StockReportEmail(Sensor):
-    """
-    StockReportEmail component that generates and emails reports
-    containing Excel workbooks and captured images based on scheduled times from Viam API data.
-    """
-    
     MODEL = Model(ModelFamily("hunter", "stock-report"), "email")
     
     @classmethod
@@ -49,13 +44,15 @@ class StockReportEmail(Sensor):
     @classmethod
     def validate_config(cls, config: ComponentConfig) -> list[str]:
         """Validate the configuration and return required dependencies."""
+        if not config.attributes.fields["location"].string_value:
+            raise ValueError("location must be specified")
+
         attributes = struct_to_dict(config.attributes)
 
-        # Check required attributes
-        required = ["location", "recipients", "api_key_id", "api_key", "org_id", "sendgrid_api_key"]
-        for attr in required:
-            if attr not in attributes:
-                raise ValueError(f"{attr} is required")
+        # Validate recipients
+        recipients = attributes.get("recipients", [])
+        if not recipients or not isinstance(recipients, list):
+            raise ValueError("recipients must be a non-empty list of email addresses")
 
         # Validate send_time
         send_time = attributes.get("send_time", "20:00")
@@ -72,6 +69,14 @@ class StockReportEmail(Sensor):
             except ValueError:
                 raise ValueError(f"Invalid process_time '{process_time}': must be in 'HH:MM' format")
 
+        # Validate capture_times if provided
+        if "capture_times" in attributes:
+            for time_str in attributes["capture_times"]:
+                try:
+                    datetime.datetime.strptime(time_str, "%H:%M")
+                except ValueError:
+                    raise ValueError(f"Invalid capture_times entry '{time_str}': must be in 'HH:MM' format")
+        
         # Validate store hours
         for hours_key in ["hours_weekdays", "hours_weekends"]:
             if hours_key not in attributes:
@@ -87,110 +92,136 @@ class StockReportEmail(Sensor):
                 except ValueError:
                     raise ValueError(f"Invalid time format in '{hours_key}': '{time_str}' - must be in 'HH:MM' format")
 
-        # Validate capture_times if provided
-        if "capture_times" in attributes:
-            for time_str in attributes["capture_times"]:
-                try:
-                    datetime.datetime.strptime(time_str, "%H:%M")
-                except ValueError:
-                    raise ValueError(f"Invalid capture_times entry '{time_str}': must be in 'HH:MM' format")
+        # Check SendGrid API key
+        sendgrid_api_key = attributes.get("sendgrid_api_key", "")
+        if not sendgrid_api_key:
+            LOGGER.warning("No SendGrid API key provided in configuration")
 
-        # Log validation completion
-        LOGGER.info(f"StockReportEmail.validate_config completed for {config.name}")
-        return []
+       
+        # Check API key ID
+        api_key_id = attributes.get("api_key_id", "")
+        if not api_key_id:
+            LOGGER.warning("No API key ID provided in configuration")
+
+        # Check API key
+        api_key = attributes.get("api_key", "")
+        if not api_key:
+            LOGGER.warning("No API key provided in configuration")
+
+        # Check org ID
+        org_id = attributes.get("org_id", "")
+        if not api_key:
+            LOGGER.warning("No org ID provided in configuration")
+
+        # Check camera configuration if enabled
+        include_images = attributes.get("include_images", False)
+        if include_images and not attributes.get("camera_name"):
+            raise ValueError("camera_name must be specified when include_images is true")
+
+        # Return required dependencies
+        # TODO: Standardize code...
+        deps = []
+
+        # Add camera dependency if configured
+        if include_images and attributes.get("camera_name"):
+            camera_name = attributes.get("camera_name")
+            # If camera_name includes a remote name, use it directly
+            if ":" in camera_name:
+                deps.append(camera_name)
+            else:
+                # No remote prefix needed now
+                deps.append(camera_name)
+
+        LOGGER.info(f"StockReportEmail.validate_config completed for {deps}")
+        return deps
     
     def __init__(self, name: str):
-        """Initialize the report email component."""
         super().__init__(name)
         self.dependencies = {}
         self.config = None
-
-        # Base configuration
         self.location = ""
         self.teleop_url = ""
+        self.recipients = []
 
         # Email configuration
         self.sendgrid_api_key = ""
         self.sender_email = "no-reply@viam.com"
-        self.sender_name = "Workbook Report"  # Consider updating to "Store Report" if desired
-        self.recipients = []
+        self.sender_name = "Stock Report Module"
+
+        # Camera configuration
+        self.camera_name = ""
+        self.include_images = False
+        self.image_width = 640
+        self.image_height = 480
+        self.capture_times = ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]
+        self.last_capture_time = None
 
         # API configuration
+        # Viam Data Client
         self.api_key_id = ""
         self.api_key = ""
         self.org_id = ""
 
-        # Scheduling
-        self.send_time = "20:00"
-        self.process_time = "19:00"  # Default to 1 hour before send
-        self.timezone = "America/New_York"
-
-        # Image capture configuration
-        self.include_images = False
-        self.camera_name = ""
-        self.capture_times = ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]
-        self.last_capture_time = None
-        self.image_width = 640
-        self.image_height = 480
-
-        # Store hours
+        # Store hours defaults
         self.hours_weekdays = ["07:00", "19:30"]  # Default for weekdays (Mon-Fri)
         self.hours_weekends = ["08:00", "17:00"]  # Default for weekends (Sat-Sun)
+        self.timezone = "America/New_York"
 
+        # Simplified scheduling
+        self.process_time = "20:00"
+        self.send_time = "20:30"
+        
         # State
-        self.last_processed_date = None
         self.last_processed_time = None
-        self.last_sent_date = None
         self.last_sent_time = None
-        self.data = None  # Path to the latest workbook file
-        self.report = "not_sent"  # Status of the last report email
-        self.workbook = "not_processed"  # Status of the last workbook processing
-
-        # Background tasks
-        self.loop_task = None
-        self.capture_task = None
+        self.last_capture_time = None
+        self.last_workbook_path = None
+        self.total_reports_sent = 0
+        self.report_status = "not_sent"
+        self.workbook_status = "not_processed"
 
         # State persistence
         self.state_dir = os.path.join(os.path.expanduser("~"), ".stock-report")
         self.state_file = os.path.join(self.state_dir, f"{name}.json")
         self.workbooks_dir = os.path.join(self.state_dir, "workbooks")
         self.images_dir = os.path.join(self.state_dir, "images")
-        self.lock_file = f"{self.state_file}.lock"
-
-        # Create necessary directories
         os.makedirs(self.state_dir, exist_ok=True)
         os.makedirs(self.workbooks_dir, exist_ok=True)
         os.makedirs(self.images_dir, exist_ok=True)
 
-        # Load persisted state
+        # Background tasks
+        self._process_task = None
+        self._send_task = None
+        self._capture_task = None
+
+        # Load state silently
         self._load_state()
-        LOGGER.info(f"Initialized with PID: {os.getpid()}")
     
     def _load_state(self):
         """Load persistent state from file with locking."""
         if os.path.exists(self.state_file):
-            # Use a file lock to ensure safe reads
-            lock = fasteners.InterProcessLock(self.lock_file)
-            
+            lock = fasteners.InterProcessLock(f"{self.state_file}.lock")
             try:
-                # Acquire the lock with a timeout
                 if lock.acquire(blocking=True, timeout=5):
                     try:
                         with open(self.state_file, "r") as f:
                             state = json.load(f)
-                            self.last_processed_date = state.get("last_processed_date")
-                            self.last_processed_time = state.get("last_processed_time")
-                            self.last_sent_date = state.get("last_sent_date")
-                            self.last_sent_time = state.get("last_sent_time")
+                            self.last_processed_time = (
+                                datetime.datetime.fromisoformat(state["last_processed_time"])
+                                if state.get("last_processed_time") else None
+                            )
+                            self.last_sent_time = (
+                                datetime.datetime.fromisoformat(state["last_sent_time"])
+                                if state.get("last_sent_time") else None
+                            )
                             self.last_capture_time = (
                                 datetime.datetime.fromisoformat(state["last_capture_time"])
-                                if state.get("last_capture_time")
-                                else None
+                                if state.get("last_capture_time") else None
                             )
-                            self.data = state.get("data")
-                            self.report = state.get("report", "not_sent")
-                            self.workbook = state.get("workbook", "not_processed")
-                        
+                            self.last_workbook_path = state.get("last_workbook_path")
+                            self.total_reports_sent = state.get("total_reports_sent", 0)
+                            self.report_status = state.get("report_status", "not_sent")
+                            self.workbook_status = state.get("workbook_status", "not_processed")
                         LOGGER.info(f"Loaded state from {self.state_file}")
                     finally:
                         lock.release()
@@ -203,32 +234,23 @@ class StockReportEmail(Sensor):
     
     def _save_state(self):
         """Save state to file for persistence across restarts using file locking."""
-        # Use a file lock to ensure safe writes
-        lock = fasteners.InterProcessLock(self.lock_file)
-        
+        lock = fasteners.InterProcessLock(f"{self.state_file}.lock")
         try:
-            # Acquire the lock with a timeout
             if lock.acquire(blocking=True, timeout=5):
                 try:
                     state = {
-                        "last_processed_date": self.last_processed_date,
-                        "last_processed_time": self.last_processed_time,
-                        "last_sent_date": self.last_sent_date,
-                        "last_sent_time": self.last_sent_time,
+                        "last_processed_time": self.last_processed_time.isoformat() if self.last_processed_time else None,
+                        "last_sent_time": self.last_sent_time.isoformat() if self.last_sent_time else None,
                         "last_capture_time": self.last_capture_time.isoformat() if self.last_capture_time else None,
-                        "data": self.data,
-                        "report": self.report,
-                        "workbook": self.workbook
+                        "last_workbook_path": self.last_workbook_path,
+                        "total_reports_sent": self.total_reports_sent,
+                        "report_status": self.report_status,
+                        "workbook_status": self.workbook_status
                     }
-                    
-                    # First write to a temporary file
                     temp_file = f"{self.state_file}.tmp"
                     with open(temp_file, "w") as f:
                         json.dump(state, f)
-                    
-                    # Then atomically replace the original file
                     os.replace(temp_file, self.state_file)
-                    
                     LOGGER.debug(f"Saved state to {self.state_file}")
                 finally:
                     lock.release()
@@ -238,82 +260,63 @@ class StockReportEmail(Sensor):
             LOGGER.error(f"Error saving state: {e}")
     
     def reconfigure(self, config: ComponentConfig, dependencies: Mapping[str, ResourceBase]):
-        """Configure the component with updated settings."""
-        # Store config and dependencies
+        """Configure the stock report with updated settings."""
+        # Store config for later use
         self.config = config
-        self.dependencies = dependencies
-
-        # Get configuration attributes
+    
+        # Configure from attributes
+        self.location = config.attributes.fields["location"].string_value
         attributes = struct_to_dict(config.attributes)
 
-        # Base configuration
-        self.location = config.attributes.fields["location"].string_value
-        self.teleop_url = attributes.get("teleop_url", "")
-
         # Email configuration
+        self.recipients = attributes.get("recipients", [])
         self.sender_email = attributes.get("sender_email", "no-reply@viam.com")
-        self.sender_name = attributes.get("sender_name", "Workbook Report")
+        self.sender_name = attributes.get("sender_name", "Stock Report Module")
         self.sendgrid_api_key = attributes.get("sendgrid_api_key", "")
-
-        # Handle recipients (string or list)
-        recipients = attributes.get("recipients", [])
-        if isinstance(recipients, list):
-            self.recipients = recipients
-        elif isinstance(recipients, str):
-            self.recipients = [r.strip() for r in recipients.split(",")]
-        else:
-            LOGGER.warning(f"Unexpected recipients format: {type(recipients)}")
-            self.recipients = [str(recipients)]
+        self.teleop_url = attributes.get("teleop_url", "")
 
         # API configuration
         self.api_key_id = attributes.get("api_key_id", "")
         self.api_key = attributes.get("api_key", "")
         self.org_id = attributes.get("org_id", "")
 
-        # Scheduling configuration
-        self.send_time = attributes.get("send_time", "20:00")
-        if "process_time" in attributes:
-            self.process_time = attributes.get("process_time")
-        else:
-            # Calculate process_time as 1 hour before send_time
-            send_dt = datetime.datetime.strptime(self.send_time, "%H:%M")
-            process_dt = send_dt - timedelta(hours=1)
-            self.process_time = process_dt.strftime("%H:%M")
-        self.timezone = attributes.get("timezone", "America/New_York")
-
-        # Image capture configuration
+        # Image configuration
         self.include_images = attributes.get("include_images", False)
         if isinstance(self.include_images, str):
             self.include_images = self.include_images.lower() == "true"
         self.camera_name = attributes.get("camera_name", "")
-        if self.include_images and not self.camera_name:
-            LOGGER.warning("Image capture enabled but no camera_name specified")
-            # Will attempt to use the first available camera at runtime
-
-        # Check dependencies to see if we actually have a camera
-        if self.include_images:
-            has_camera = False
-            for name, resource in self.dependencies.items():
-                if hasattr(resource, 'get_image'):
-                    if self.camera_name:
-                        if self.camera_name.lower() in str(name).lower():
-                            has_camera = True
-                            break
-                    else:
-                        self.camera_name = str(name)
-                        has_camera = True
-                        LOGGER.info(f"No camera specified, using first found camera: {name}")
-                        break
-            if not has_camera:
-                LOGGER.warning("No camera found in dependencies yet")
-
-        self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
         self.image_width = int(attributes.get("image_width", 640))
         self.image_height = int(attributes.get("image_height", 480))
 
         # Store hours
         self.hours_weekdays = attributes.get("hours_weekdays", ["07:00", "19:30"])
         self.hours_weekends = attributes.get("hours_weekends", ["08:00", "17:00"])
+
+        # Scheduling configuration
+        self.send_time = attributes.get("send_time", "20:00")
+        # Default to send_time if not set
+        self.process_time = attributes.get("process_time", self.send_time)  
+        # If still unset, calculate 1 hour before send_time
+        if not self.process_time:  
+            send_dt = datetime.datetime.strptime(self.send_time, "%H:%M")
+            process_dt = send_dt - datetime.timedelta(hours=1)
+            self.process_time = process_dt.strftime("%H:%M")
+        self.timezone = attributes.get("timezone", "America/New_York")
+        self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
+
+        # Sort the capture times to ensure they're in chronological order
+        self.capture_times = sorted(list(set(self.capture_times)))
+
+        # Store dependencies
+        self.dependencies = dependencies
+
+        # Cancel existing tasks if they exist
+        if self._process_task and not self._process_task.done():
+            self._process_task.cancel()
+        if self._send_task and not self._send_task.done():
+            self._send_task.cancel()
+        if self._capture_task and not self._capture_task.done():
+            self._capture_task.cancel()
 
         # Log configuration details
         LOGGER.info(f"Configured {self.name} for location '{self.location}'")
@@ -329,685 +332,441 @@ class StockReportEmail(Sensor):
         else:
             LOGGER.info("Image capture disabled")
 
-        # Cancel any existing scheduled tasks
-        if self.loop_task and not self.loop_task.done():
-            self.loop_task.cancel()
-        if self.capture_task and not self.capture_task.done():
-            self.capture_task.cancel()
-
-        # Start scheduled tasks
-        self.loop_task = asyncio.create_task(self.run_scheduled_loop())
-
-    def _get_next_process_time(self, now: datetime.datetime) -> datetime.datetime:
-        """Calculate the next process time based on current time and process_time."""
-        today = now.date()
-        process_time_dt = datetime.datetime.combine(today, datetime.datetime.strptime(self.process_time, "%H:%M").time())
-        if now > process_time_dt:
-            process_time_dt += timedelta(days=1)
-        return process_time_dt
-
-    def _get_next_send_time(self, now: datetime.datetime) -> datetime.datetime:
-        """Calculate the next send time based on current time and send_time."""
-        today = now.date()
-        send_time_dt = datetime.datetime.combine(today, datetime.datetime.strptime(self.send_time, "%H:%M").time())
-        if now > send_time_dt:
-            send_time_dt += timedelta(days=1)
-        return send_time_dt
-        
-    def _get_next_capture_time(self, now: datetime.datetime) -> datetime.datetime:
-        """Calculate the next capture time based on current time and capture_times."""
-        today = now.date()
-        tomorrow = today + timedelta(days=1)
-        
-        # Convert capture_times to datetime objects for today
-        capture_times_today = [
-            datetime.datetime.combine(today, datetime.datetime.strptime(t, "%H:%M").time())
-            for t in self.capture_times
-        ]
-        
-        # Convert capture_times to datetime objects for tomorrow
-        capture_times_tomorrow = [
-            datetime.datetime.combine(tomorrow, datetime.datetime.strptime(t, "%H:%M").time())
-            for t in self.capture_times
-        ]
-        
-        # Find the next capture time (either today or tomorrow)
-        future_captures = [dt for dt in capture_times_today + capture_times_tomorrow if dt > now]
-        if future_captures:
-            return min(future_captures)
-        else:
-            # Default to first capture time the day after tomorrow
-            day_after_tomorrow = tomorrow + timedelta(days=1)
-            return datetime.datetime.combine(day_after_tomorrow, 
-                                            datetime.datetime.strptime(self.capture_times[0], "%H:%M").time())
+        # Start background tasks
+        self._process_task = asyncio.create_task(self._run_process())
+        self._send_task = asyncio.create_task(self._run_send())
+        if self.include_images:
+            self._capture_task = asyncio.create_task(self._run_capture())
     
-    async def run_scheduled_loop(self):
-        """Run a scheduled loop that wakes up for processing and sending reports."""
-        lock = fasteners.InterProcessLock(self.lock_file)
-        if not lock.acquire(blocking=False):
-            LOGGER.info(f"Another instance running, exiting (PID {os.getpid()})")
-            return
-            
+    async def _run_process(self):
+        """Run the workbook processing loop."""
+        LOGGER.info(f"Starting process loop for {self.name} (PID: {os.getpid()})")
         try:
-            LOGGER.info(f"Started scheduled loop with PID {os.getpid()}")
-            
             while True:
-                now = datetime.datetime.now()
-                today_str = now.strftime("%Y%m%d")
-                
-                next_process = self._get_next_process_time(now)
-                next_send = self._get_next_send_time(now)
-                next_capture = None
-                
-                # Only calculate next capture if images are enabled
-                if self.include_images:
-                    next_capture = self._get_next_capture_time(now)
+                current_time = datetime.datetime.now()
+                next_process = self._get_next_process_time(current_time)
+                sleep_seconds = (next_process - current_time).total_seconds()
 
-                # Sleep until the earliest event (process, send, or capture)
-                sleep_until_process = (next_process - now).total_seconds()
-                sleep_until_send = (next_send - now).total_seconds()
-                
-                if next_capture:
-                    sleep_until_capture = (next_capture - now).total_seconds()
-                    sleep_seconds = min(sleep_until_process, sleep_until_send, sleep_until_capture)
-                    
-                    if sleep_seconds == sleep_until_capture:
-                        next_event = "capture"
-                    elif sleep_seconds == sleep_until_process:
-                        next_event = "process"
-                    else:
-                        next_event = "send"
-                else:
-                    sleep_seconds = min(sleep_until_process, sleep_until_send)
-                    next_event = "process" if sleep_seconds == sleep_until_process else "send"
-                
-                next_time = {
-                    "process": next_process,
-                    "send": next_send,
-                    "capture": next_capture
-                }.get(next_event)
-                
-                LOGGER.info(f"Sleeping for {sleep_seconds:.0f} seconds until {next_event} at {next_time}")
-                
+                if sleep_seconds <= 0:
+                    LOGGER.info(f"Already past process time {next_process.strftime('%H:%M')}, processing now")
+                    await self.process_workbook()
+                    await asyncio.sleep(1)  # Small gap between checks
+                    continue
+
+                LOGGER.info(f"Next process scheduled for {next_process.strftime('%H:%M')} (sleeping {sleep_seconds:.1f} seconds)")
                 await asyncio.sleep(sleep_seconds)
+                await self.process_workbook()
 
-                # Check what we woke up for
-                now = datetime.datetime.now()
-                today_str = now.strftime("%Y%m%d")
-                
-                # Check if it's time to capture
-                if self.include_images and next_capture and now >= next_capture:
-                    await self.capture_image(now)
-                    self._save_state()
-                
-                # Check if it's time to process
-                process_time_today = datetime.datetime.strptime(self.process_time, "%H:%M").time()
-                if (now.hour == process_time_today.hour and 
-                    now.minute == process_time_today.minute and 
-                    self.last_processed_date != today_str):
-                    await self.process_workbook(now, today_str)
-                
-                # Check if it's time to send
-                send_time_today = datetime.datetime.strptime(self.send_time, "%H:%M").time()
-                if (now.hour == send_time_today.hour and 
-                    now.minute == send_time_today.minute and 
-                    self.last_sent_date != today_str):
-                    await self.send_processed_report(now, today_str)
-                
         except asyncio.CancelledError:
-            LOGGER.info("Scheduled loop cancelled")
+            LOGGER.info(f"Process loop cancelled for {self.name}")
             raise
         except Exception as e:
-            LOGGER.error(f"Scheduled loop failed: {e}")
-        finally:
-            lock.release()
-            LOGGER.info(f"Released lock, loop exiting (PID {os.getpid()})")
-            
-    async def capture_image(self, now):
-        """Capture an image and save it to disk."""
-        if not self.include_images:
-            return None
-            
+            LOGGER.error(f"Error in process loop: {e}")
+            await asyncio.sleep(60)  # Wait before restarting
+
+    async def _run_send(self):
+        """Run the report sending loop."""
+        LOGGER.info(f"Starting send loop for {self.name} (PID: {os.getpid()})")
         try:
-            # Try to find any resource that could be a camera, with much more flexibility
-            camera = None
-            for name, resource in self.dependencies.items():
-                # Accept any resource that has a get_image method
-                if hasattr(resource, 'get_image'):
-                    # If camera_name is specified, try to match it
-                    if not self.camera_name or self.camera_name.lower() in str(name).lower():
-                        camera = resource
-                        LOGGER.info(f"Found camera: {name}")
-                        break
-            
-            if not camera:
-                LOGGER.warning(f"No usable camera found in dependencies")
-                return None
-            
-            # Continue with image capture...
-            LOGGER.info(f"Capturing image from camera")
-            
-            # Capture image with retry logic
-            for attempt in range(3):
-                try:
-                    # Capture image - wrapped in a try block for resilience
-                    try:
-                        image = await camera.get_image(mime_type="image/jpeg")
-                    except Exception as e:
-                        # Fallback to get_image without mime_type if needed
-                        LOGGER.warning(f"Failed to get image with mime_type, trying without: {e}")
-                        image = await camera.get_image()
-                    
-                    # Get the image data
-                    today_str = now.strftime("%Y%m%d")
-                    timestamp = now.strftime("%Y%m%d_%H%M%S")
-                    filename = f"{timestamp}_{self.name}.jpg"
-                    
-                    # Create daily directory
-                    daily_dir = os.path.join(self.images_dir, today_str)
-                    os.makedirs(daily_dir, exist_ok=True)
-                    
-                    image_path = os.path.join(daily_dir, filename)
-                    
-                    # Handle different image types with maximum flexibility
-                    saved = False
-                    if hasattr(image, 'data') and image.data:
-                        # Use PIL to process image.data
-                        try:
-                            pil_image = Image.open(BytesIO(image.data))
-                            pil_image.save(image_path, "JPEG")
-                            saved = True
-                        except Exception as img_err:
-                            LOGGER.warning(f"Failed to process image.data: {img_err}")
-                            
-                    if not saved and isinstance(image, bytes):
-                        # Direct bytes
-                        with open(image_path, "wb") as f:
-                            f.write(image)
-                        saved = True
-                            
-                    if not saved and isinstance(image, dict) and 'data' in image and image['data']:
-                        # Dict with data
-                        with open(image_path, "wb") as f:
-                            f.write(image['data'])
-                        saved = True
-                    
-                    if not saved:
-                        LOGGER.warning(f"Unsupported image type: {type(image)}") 
-                        if attempt < 2:
-                            await asyncio.sleep(2)
-                            continue
-                        return None
-                    
-                    self.last_capture_time = now
-                    LOGGER.info(f"Saved image to {image_path}")
-                    return image_path
-                
-                except Exception as e:
-                    LOGGER.error(f"Error capturing image (attempt {attempt + 1}): {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(2)
-                    else:
-                        LOGGER.error("All capture attempts failed")
-                        return None
-        
+            while True:
+                current_time = datetime.datetime.now()
+                next_send = self._get_next_send_time(current_time)
+                sleep_seconds = (next_send - current_time).total_seconds()
+
+                if sleep_seconds <= 0:
+                    LOGGER.info(f"Already past send time {next_send.strftime('%H:%M')}, sending now")
+                    await self.send_report_if_ready()
+                    await asyncio.sleep(1)
+                    continue
+
+                LOGGER.info(f"Next send scheduled for {next_send.strftime('%H:%M')} (sleeping {sleep_seconds:.1f} seconds)")
+                await asyncio.sleep(sleep_seconds)
+                await self.send_report_if_ready()
+
+        except asyncio.CancelledError:
+            LOGGER.info(f"Send loop cancelled for {self.name}")
+            raise
         except Exception as e:
-            LOGGER.error(f"Fatal error in capture_image: {e}")
-            return None
+            LOGGER.error(f"Error in send loop: {e}")
+            await asyncio.sleep(60)
     
+    async def _run_capture(self):
+        """Run the image capture loop."""
+        LOGGER.info(f"Starting capture loop for {self.name} (PID: {os.getpid()})")
+        try:
+            while True:
+                current_time = datetime.datetime.now()
+                next_capture = self._get_next_capture_time(current_time)
+                sleep_seconds = (next_capture - current_time).total_seconds()
+
+                if sleep_seconds <= 0:
+                    LOGGER.info(f"Already past capture time {next_capture.strftime('%H:%M')}, capturing now")
+                    await self.capture_image()
+                    await asyncio.sleep(1)
+                    continue
+
+                LOGGER.info(f"Next capture scheduled for {next_capture.strftime('%H:%M')} (sleeping {sleep_seconds:.1f} seconds)")
+                await asyncio.sleep(sleep_seconds)
+                await self.capture_image()
+
+        except asyncio.CancelledError:
+            LOGGER.info(f"Capture loop cancelled for {self.name}")
+            raise
+        except Exception as e:
+            LOGGER.error(f"Error in capture loop: {e}")
+            await asyncio.sleep(60)
+
+    def _get_next_process_time(self, current_time: datetime.datetime) -> datetime.datetime:
+        """Calculate the next process time."""
+        today = current_time.date()
+        process_dt = datetime.datetime.combine(today, datetime.time(*map(int, self.process_time.split(":"))))
+        if current_time > process_dt:
+            process_dt += datetime.timedelta(days=1)
+        return process_dt
+
+    def _get_next_send_time(self, current_time: datetime.datetime) -> datetime.datetime:
+        """Calculate the next send time."""
+        today = current_time.date()
+        send_dt = datetime.datetime.combine(today, datetime.time(*map(int, self.send_time.split(":"))))
+        if current_time > send_dt:
+            send_dt += datetime.timedelta(days=1)
+        return send_dt
+
+    def _get_next_capture_time(self, current_time: datetime.datetime) -> datetime.datetime:
+        """Calculate the next capture time."""
+        today = current_time.date()
+        tomorrow = today + datetime.timedelta(days=1)
+        capture_times_today = [
+            datetime.datetime.combine(today, datetime.time(*map(int, t.split(":"))))
+            for t in self.capture_times
+        ]
+        capture_times_tomorrow = [
+            datetime.datetime.combine(tomorrow, datetime.time(*map(int, t.split(":"))))
+            for t in self.capture_times
+        ]
+        future_captures = [dt for dt in capture_times_today + capture_times_tomorrow if dt > current_time]
+        return min(future_captures) if future_captures else datetime.datetime.combine(
+            tomorrow + datetime.timedelta(days=1), datetime.time(*map(int, self.capture_times[0].split(":")))
+        )
+
+    async def capture_image(self):
+        """Capture an image from the camera and save it to disk."""
+        if not self.include_images or not self.camera_name:
+            return
+
+        camera = None
+        for name, resource in self.dependencies.items():
+            if isinstance(resource, Camera) and self.camera_name.lower() in str(name).lower():
+                camera = resource
+                LOGGER.info(f"Found camera: {name}")
+                break
+
+        if not camera:
+            LOGGER.warning(f"Camera '{self.camera_name}' not found in dependencies")
+            return
+
+        try:
+            LOGGER.info(f"Capturing image from camera '{self.camera_name}'")
+            image = await camera.get_image(mime_type="image/jpeg")
+            now = datetime.datetime.now()
+            timestamp = now.strftime("%Y%m%d_%H%M%S")
+            filename = f"{timestamp}_{self.name}.jpg"
+            daily_dir = os.path.join(self.images_dir, now.strftime("%Y%m%d"))
+            os.makedirs(daily_dir, exist_ok=True)
+            image_path = os.path.join(daily_dir, filename)
+
+            if isinstance(image, ViamImage):
+                pil_image = Image.open(BytesIO(image.data))
+                pil_image.save(image_path, "JPEG")
+            elif isinstance(image, bytes):
+                with open(image_path, "wb") as f:
+                    f.write(image)
+            else:
+                LOGGER.warning(f"Unsupported image type: {type(image)}")
+                return
+
+            self.last_capture_time = now
+            LOGGER.info(f"Saved image to {image_path}")
+            annotated_path = self.annotate_image(image_path)
+            if annotated_path:
+                LOGGER.info(f"Annotated image saved to {annotated_path}")
+
+        except Exception as e:
+            LOGGER.error(f"Error capturing image: {e}")
+
     def annotate_image(self, image_path, font_size=20):
         """Annotate an image with timestamp and location information."""
         try:
             img = Image.open(image_path)
             draw = ImageDraw.Draw(img)
-            
-            # Extract timestamp from filename (format: YYYYMMDD_HHMMSS_*)
             filename = os.path.basename(image_path)
             parts = filename.split('_')
-            
-            if len(parts) >= 2:
-                # Format: YYYYMMDD_HHMMSS becomes "YYYY-MM-DD HH:MM:SS"
-                date_part = parts[0]
-                time_part = parts[1]
-                
-                if len(date_part) == 8 and len(time_part) >= 6:
-                    formatted_date = f"{date_part[0:4]}-{date_part[4:6]}-{date_part[6:8]}"
-                    formatted_time = f"{time_part[0:2]}:{time_part[2:4]}:{time_part[4:6]}"
-                    timestamp_text = f"{formatted_date} {formatted_time}"
-                else:
-                    timestamp_text = filename
+            if len(parts) >= 2 and len(parts[0]) == 8 and len(parts[1]) >= 6:
+                date_part, time_part = parts[0], parts[1]
+                timestamp_text = f"{date_part[0:4]}-{date_part[4:6]}-{date_part[6:8]} {time_part[0:2]}:{time_part[2:4]}:{time_part[4:6]}"
             else:
                 timestamp_text = filename
-                
-            # Add location information
+
             text = f"{timestamp_text} - {self.location}"
-            
-            # Try to use a default font
-            try:
-                font = ImageFont.load_default()
-            except Exception:
-                font = None
-                
-            # Get text size
-            if font:
-                text_bbox = draw.textbbox((0, 0), text, font=font)
-                text_width = text_bbox[2] - text_bbox[0]
-                text_height = text_bbox[3] - text_bbox[1]
-            else:
-                # Approximate if we can't get font metrics
-                text_width = len(text) * font_size * 0.6
-                text_height = font_size * 1.2
-                
-            # Position text in bottom corner with padding
-            x = img.width - text_width - 10
-            y = img.height - text_height - 10
-            
-            # Add semi-transparent background for readability
-            draw.rectangle([x-5, y-5, x+text_width+5, y+text_height+5], 
-                          fill=(0, 0, 0, 128))
-            
-            # Draw text
+            font = ImageFont.load_default() if hasattr(ImageFont, 'load_default') else None
+            text_bbox = draw.textbbox((0, 0), text, font=font) if font else (0, 0, len(text) * font_size * 0.6, font_size * 1.2)
+            text_width, text_height = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
+            x, y = img.width - text_width - 10, img.height - text_height - 10
+
+            draw.rectangle([x-5, y-5, x+text_width+5, y+text_height+5], fill=(0, 0, 0, 128))
             draw.text((x, y), text, fill="white", font=font)
-            
-            # Save annotated image
             annotated_path = image_path.replace(".jpg", "_annotated.jpg")
             img.save(annotated_path, "JPEG")
             LOGGER.info(f"Created annotated image: {annotated_path}")
-            
             return annotated_path
-            
+
         except Exception as e:
             LOGGER.error(f"Error annotating image: {e}")
-            return image_path  # Return original if annotation fails
-    
-    async def process_workbook(self, timestamp, date_str):
-        """
-        Process the Excel workbook for data from the specified date.
+            return image_path
 
-        Args:
-            timestamp: Datetime object representing the processing time
-            date_str: String representing the date to process (YYYYMMDD)
-        """
+    async def process_workbook(self):
+        """Process the Excel workbook for today's data."""
+        now = datetime.datetime.now()
+        date_str = now.strftime("%Y%m%d")
         try:
-            # Parse target date
-            target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
-            target_date = target_date.replace(tzinfo=tz.gettz(self.timezone))
-            LOGGER.info(f"Processing workbook for target date: {target_date.strftime('%Y-%m-%d')}")
+            target_date = now.replace(tzinfo=tz.gettz(self.timezone))
+            LOGGER.info(f"Processing workbook for date: {date_str}")
 
-            # Define file paths
             template_path = os.path.join(self.workbooks_dir, "template.xlsx")
             raw_data_path = os.path.join(self.workbooks_dir, "raw_export.xlsx")
-
-            # Verify template exists
             if not os.path.exists(template_path):
                 LOGGER.error(f"Template file not found: {template_path}")
-                self.workbook = "error: missing template"
+                self.workbook_status = "error: missing template"
                 self._save_state()
-                return None
+                return
 
-            # Get store hours for the target date
             opening_time, closing_time = self._get_store_hours_for_date(target_date)
-
-            # Create datetime objects for the store hours
             open_hour, open_minute = map(int, opening_time.split(':'))
             close_hour, close_minute = map(int, closing_time.split(':'))
-
             start_time = target_date.replace(hour=open_hour, minute=open_minute, second=0, microsecond=0)
             end_time = target_date.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
 
             LOGGER.info(f"Exporting data from {start_time} to {end_time}")
-
-            # Export raw data
-            exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.timezone)
+            exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.location, self.timezone)
             await exporter.export_to_excel(
-                raw_data_path,
-                "langer_fill",
-                start_time,
-                end_time,
-                bucket_period="PT5M",
-                bucket_method="pct99",
-                include_keys_regex=".*_raw",
-                tab_name="RAW"
+                raw_data_path, "langer_fill", start_time, end_time,
+                bucket_period="PT5M", bucket_method="pct99", include_keys_regex=".*_raw", tab_name="RAW"
             )
 
-            LOGGER.info(f"Raw data exported to {raw_data_path}")
-
-            # Create WIP file with naming convention
-            wip_filename = f"{target_date.strftime('%Y%m%d')}_{self.name}_wip.xlsx"
+            wip_filename = f"{date_str}_{self.name}_wip.xlsx"
+            final_filename = f"{date_str}_{self.name}.xlsx"
             wip_path = os.path.join(self.workbooks_dir, wip_filename)
-
-            # Create final filename with convention
-            final_filename = f"{target_date.strftime('%Y%m%d')}_{self.name}.xlsx"
             final_path = os.path.join(self.workbooks_dir, final_filename)
 
-            # Copy template to WIP file
             shutil.copy(template_path, wip_path)
-
-            # Process the raw data and update the workbook
             num_data_rows = self._update_raw_import_sheet(raw_data_path, wip_path)
             LOGGER.info(f"Updated Raw Import sheet with {num_data_rows} rows")
-
-            # Fix the workbook
             self._fix_workbook(wip_path, num_data_rows, final_path)
             LOGGER.info(f"Created final workbook: {final_path}")
 
-            # Clean up WIP file
             if os.path.exists(wip_path):
                 os.remove(wip_path)
                 LOGGER.info(f"Removed temporary WIP file: {wip_path}")
 
-            # Update state
-            self.data = final_path
-            self.last_processed_date = date_str
-            self.last_processed_time = str(timestamp)
-            self.workbook = "processed"
+            self.last_workbook_path = final_path
+            self.last_processed_time = now
+            self.workbook_status = "processed"
             self._save_state()
-
-            return final_path
 
         except Exception as e:
             LOGGER.error(f"Failed to process workbook: {e}")
-            self.workbook = f"error: {str(e)}"
+            self.workbook_status = f"error: {str(e)}"
             self._save_state()
-            return None
-    
+
     def _get_store_hours_for_date(self, date):
         """Get store hours for the specified date."""
-        # Get day of week (0=Monday, 6=Sunday)
-        weekday = date.weekday()
+        return tuple(self.hours_weekends if date.weekday() >= 5 else self.hours_weekdays)
 
-        # Check if it's a weekend (Saturday=5, Sunday=6)
-        if weekday == 5 or weekday == 6:  # Saturday or Sunday
-            return tuple(self.hours_weekends)
-        else:  # Weekdays (Monday to Friday)
-            return tuple(self.hours_weekdays)
-    
     def _update_raw_import_sheet(self, raw_file, output_file):
-        """
-        Update the Raw Import sheet in the output workbook with data from the raw file.
-        
-        Args:
-            raw_file: Path to the raw data Excel file
-            output_file: Path to the output workbook
-            
-        Returns:
-            Number of data rows copied
-        """
+        """Update the Raw Import sheet in the output workbook."""
         try:
-            # Load data from raw export file
             LOGGER.info(f"Loading raw data from {raw_file}")
             raw_wb = openpyxl.load_workbook(raw_file, data_only=True)
-            
             if "RAW" not in raw_wb.sheetnames:
-                LOGGER.error(f"RAW sheet not found in exported data")
                 raise ValueError("RAW sheet not found in exported data")
-                
             raw_sheet = raw_wb["RAW"]
-            
-            # Get data from raw sheet
             data_rows = list(raw_sheet.iter_rows(min_row=2, values_only=True))
-            
-            LOGGER.info(f"Loaded {len(data_rows)} rows of data from raw export")
-            
-            # Open the output workbook
+            LOGGER.info(f"Loaded {len(data_rows)} rows from raw export")
+
             LOGGER.info(f"Opening output workbook: {output_file}")
             output_wb = openpyxl.load_workbook(output_file)
-            
             if "Raw Import" not in output_wb.sheetnames:
-                LOGGER.error(f"Raw Import sheet not found in template")
                 raise ValueError("Raw Import sheet not found in template")
-                
             output_sheet = output_wb["Raw Import"]
-            
-            # Clear existing data from Raw Import sheet (keeping headers)
+
             LOGGER.info("Clearing existing data from Raw Import sheet")
             for row in output_sheet.iter_rows(min_row=2):
                 for cell in row:
                     cell.value = None
-            
-            # Copy data to Raw Import sheet
+
             LOGGER.info("Copying data to Raw Import sheet")
             for r_idx, row_data in enumerate(data_rows, start=2):
                 for c_idx, value in enumerate(row_data, start=1):
                     output_sheet.cell(row=r_idx, column=c_idx).value = value
-            
-            # Save the workbook
+
             LOGGER.info(f"Saving updated workbook to {output_file}")
             output_wb.save(output_file)
-            
-            LOGGER.info(f"Raw Import sheet updated with {len(data_rows)} rows of data")
+            LOGGER.info(f"Raw Import sheet updated with {len(data_rows)} rows")
             return len(data_rows)
-            
+
         except Exception as e:
             LOGGER.error(f"Error updating Raw Import sheet: {e}")
             raise
-    
+
     def _get_sheet_mappings(self, excel_path):
-        """
-        Extract the mapping of sheet names to their XML filenames in the workbook.
-        
-        Args:
-            excel_path: Path to the Excel workbook file
-            
-        Returns:
-            Dictionary mapping sheet names to XML filenames
-        """
+        """Extract sheet mappings from the Excel workbook."""
         temp_dir = os.path.join(self.workbooks_dir, "temp_excel")
         os.makedirs(temp_dir, exist_ok=True)
-        
         try:
             with zipfile.ZipFile(excel_path, "r") as zip_ref:
                 zip_ref.extractall(temp_dir)
 
             workbook_xml_path = os.path.join(temp_dir, "xl", "workbook.xml")
             rels_xml_path = os.path.join(temp_dir, "xl", "_rels", "workbook.xml.rels")
-
-            if not os.path.exists(workbook_xml_path):
-                raise FileNotFoundError(f"workbook.xml not found in {excel_path}")
-            if not os.path.exists(rels_xml_path):
-                raise FileNotFoundError(f"workbook.xml.rels not found in {excel_path}")
+            if not os.path.exists(workbook_xml_path) or not os.path.exists(rels_xml_path):
+                raise FileNotFoundError(f"Required XML files not found in {excel_path}")
 
             sheet_mapping = {}
-
-            # Parse workbook.xml to get sheet names and their relationship IDs
             wb_tree = ET.parse(workbook_xml_path)
             wb_root = wb_tree.getroot()
-            
-            # Handle Excel namespaces
-            ns = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
-                  'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
-            
-            sheet_rel_map = {}  # Map r:id to sheet name
+            ns = {
+                'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            }
+            # Use fully qualified namespace for r:id
+            sheet_rel_map = {}
             for sheet in wb_root.findall(".//ns:sheets/ns:sheet", ns):
-                sheet_name = sheet.attrib["name"]
-                sheet_rel_id = sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
-                sheet_rel_map[sheet_rel_id] = sheet_name
+                sheet_name = sheet.attrib.get("name", "unknown")
+                sheet_rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                if sheet_rel_id:
+                    sheet_rel_map[sheet_rel_id] = sheet_name
+                else:
+                    LOGGER.warning(f"Sheet '{sheet_name}' missing r:id attribute in {workbook_xml_path}")
 
-            # Parse workbook.xml.rels to get sheet file paths
             rels_tree = ET.parse(rels_xml_path)
             rels_root = rels_tree.getroot()
             rels_ns = {'ns': 'http://schemas.openxmlformats.org/package/2006/relationships'}
-
             for rel in rels_root.findall(".//ns:Relationship", rels_ns):
-                rel_id = rel.attrib["Id"]
-                target = rel.attrib["Target"]
-                
+                rel_id = rel.attrib.get("Id")
+                target = rel.attrib.get("Target")
                 if rel_id in sheet_rel_map and "worksheets" in target:
-                    sheet_name = sheet_rel_map[rel_id]
-                    sheet_mapping[sheet_name] = os.path.basename(target)
+                    sheet_mapping[sheet_rel_map[rel_id]] = os.path.basename(target)
 
             LOGGER.info(f"Sheet mappings: {sheet_mapping}")
             return sheet_mapping
-            
+
         except Exception as e:
             LOGGER.error(f"Error extracting sheet mappings: {e}")
             raise
         finally:
-            # Clean up temporary directory
             if os.path.exists(temp_dir) and "temp_excel" not in excel_path:
                 shutil.rmtree(temp_dir)
-    
+
     def _fix_workbook(self, wip_path, num_data_rows, final_path):
-        """
-        Fix the workbook structure to handle row counts and formulas.
-        
-        Args:
-            wip_path: Path to the WIP workbook
-            num_data_rows: Number of data rows
-            final_path: Path to save the final workbook
-            
-        Returns:
-            Path to the fixed workbook
-        """
-        # Create a unique temp directory
+        """Fix the workbook structure for row counts and formulas."""
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         temp_dir = os.path.join(self.workbooks_dir, f"temp_excel_{timestamp}")
-        
         try:
-            # Ensure WIP file exists
             if not os.path.exists(wip_path):
-                LOGGER.error(f"WIP file not found: {wip_path}")
                 raise FileNotFoundError(f"WIP file not found: {wip_path}")
 
-            # Create a fresh temp directory
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
             os.makedirs(temp_dir, exist_ok=True)
             LOGGER.info(f"Created temp directory: {temp_dir}")
-            
-            # Extract the Excel file
-            LOGGER.info(f"Extracting WIP Excel file: {wip_path}")
             with zipfile.ZipFile(wip_path, "r") as zip_ref:
                 zip_ref.extractall(temp_dir)
-            
-            # Get sheet mappings
-            LOGGER.info("Obtaining sheet mappings")
+
             sheet_mappings = self._get_sheet_mappings(wip_path)
-            
-            # Define namespaces
             namespaces = {
                 'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
                 'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
             }
-            
-            # Register namespaces for proper XML generation
             for prefix, uri in namespaces.items():
                 ET.register_namespace(prefix, uri)
-            # Register default namespace
             ET.register_namespace('', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
-            
-            # Path to worksheets directory
+
             worksheets_dir = os.path.join(temp_dir, "xl", "worksheets")
             if not os.path.exists(worksheets_dir):
-                LOGGER.error(f"Worksheets directory not found: {worksheets_dir}")
                 raise FileNotFoundError(f"Worksheets directory not found: {worksheets_dir}")
-            
-            # Process each sheet that needs fixing
+
             sheets_to_process = ["Calibrated Values", "Bounded Calibrated", "Empty Shelf Tracker"]
-            
             for sheet_name in sheets_to_process:
                 if sheet_name not in sheet_mappings:
                     LOGGER.warning(f"Sheet '{sheet_name}' not found in workbook. Skipping...")
                     continue
-                
                 sheet_xml_path = os.path.join(worksheets_dir, sheet_mappings[sheet_name])
                 if not os.path.exists(sheet_xml_path):
                     LOGGER.error(f"Sheet XML file not found: {sheet_xml_path}")
                     continue
-                
-                LOGGER.info(f"Processing sheet: {sheet_name}")
-                
-                # Parse sheet XML
-                try:
-                    tree = ET.parse(sheet_xml_path)
-                    root = tree.getroot()
-                    
-                    # Find sheetData element
-                    sheet_data = root.find(".//ns:sheetData", namespaces)
-                    if sheet_data is None:
-                        LOGGER.warning(f"No sheetData found in {sheet_name}, skipping modifications")
-                        continue
-                    
-                    # Remove excess rows
-                    rows_to_remove = []
-                    for row in sheet_data.findall(".//ns:row", namespaces):
-                        row_number = int(row.attrib.get("r", "0"))
-                        if row_number > num_data_rows + 1:  # +1 for header row
-                            rows_to_remove.append(row)
 
-                    # Remove excess rows
-                    if rows_to_remove:
-                        first_row = rows_to_remove[0].attrib.get('r') if rows_to_remove else "N/A"
-                        last_row = rows_to_remove[-1].attrib.get('r') if rows_to_remove else "N/A"
-                        
-                        for row in rows_to_remove:
-                            sheet_data.remove(row)
-        
-                        LOGGER.info(f"Removed {len(rows_to_remove)} excess rows ({first_row} to {last_row}) from {sheet_name}")
-                    
-                    # Save the modified sheet XML
-                    tree.write(sheet_xml_path, encoding="UTF-8", xml_declaration=True)
-                    LOGGER.info(f"Saved modifications to {sheet_xml_path}")
-                    
-                except Exception as e:
-                    LOGGER.error(f"Error processing sheet {sheet_name}: {e}")
-                    raise
-            
-            # Create the final zip file (Excel file)
-            LOGGER.info(f"Creating final workbook file: {final_path}")
+                LOGGER.info(f"Processing sheet: {sheet_name}")
+                tree = ET.parse(sheet_xml_path)
+                root = tree.getroot()
+                sheet_data = root.find(".//ns:sheetData", namespaces)
+                if sheet_data is None:
+                    LOGGER.warning(f"No sheetData found in {sheet_name}, skipping modifications")
+                    continue
+
+                rows_to_remove = [row for row in sheet_data.findall(".//ns:row", namespaces) if int(row.attrib.get("r", "0")) > num_data_rows + 1]
+                if rows_to_remove:
+                    first_row = rows_to_remove[0].attrib.get('r', "N/A")
+                    last_row = rows_to_remove[-1].attrib.get('r', "N/A")
+                    for row in rows_to_remove:
+                        sheet_data.remove(row)
+                    LOGGER.info(f"Removed {len(rows_to_remove)} excess rows ({first_row} to {last_row}) from {sheet_name}")
+
+                tree.write(sheet_xml_path, encoding="UTF-8", xml_declaration=True)
+                LOGGER.info(f"Saved modifications to {sheet_xml_path}")
+
+            LOGGER.info(f"Creating final workbook: {final_path}")
             with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zip_out:
                 for root_dir, _, files in os.walk(temp_dir):
                     for file in files:
                         file_path = os.path.join(root_dir, file)
                         arcname = os.path.relpath(file_path, temp_dir)
                         zip_out.write(file_path, arcname)
-            
+
             LOGGER.info(f"Successfully created final workbook: {final_path}")
             return final_path
-            
+
         except Exception as e:
-            LOGGER.error(f"Error in fix_workbook method: {e}")
+            LOGGER.error(f"Error fixing workbook: {e}")
             raise
         finally:
-            # Clean up temporary directory
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
                 LOGGER.info(f"Cleaned up temporary directory: {temp_dir}")
-    
+
     def _get_daily_images(self, day_str):
         """Get all captured images for a specific day."""
         daily_dir = os.path.join(self.images_dir, day_str)
-        
         if not os.path.exists(daily_dir):
             LOGGER.info(f"No image directory for {day_str}")
             return []
-            
-        # Get all jpg images in the directory
-        image_files = sorted([
-            os.path.join(daily_dir, f) 
-            for f in os.listdir(daily_dir) 
-            if f.endswith(".jpg") and not f.endswith("_annotated.jpg")
-        ])
-        
+        image_files = sorted(
+            [os.path.join(daily_dir, f) for f in os.listdir(daily_dir) if f.endswith(".jpg") and not f.endswith("_annotated.jpg")]
+        )
         LOGGER.info(f"Found {len(image_files)} images for {day_str}")
         return image_files
-            
-    async def send_processed_report(self, timestamp, date_str):
-        """Send a previously processed report via email with optional images."""
-        if not self.data or not os.path.exists(self.data):
+
+    async def send_report_if_ready(self):
+        """Send a report if a processed workbook is available."""
+        if not self.last_workbook_path or not os.path.exists(self.last_workbook_path):
             LOGGER.error("No processed workbook available to send report")
-            self.report = "error: no processed workbook"
+            self.report_status = "error: no processed workbook"
             self._save_state()
             return
-            
+
+        now = datetime.datetime.now()
+        date_str = now.strftime("%Y%m%d")
         try:
-            # Annotate any captured images for the day
             daily_images = []
-            
             if self.include_images:
                 image_files = self._get_daily_images(date_str)
-                
-                # Annotate images
                 for img_path in image_files:
                     try:
                         annotated_path = self.annotate_image(img_path)
@@ -1015,335 +774,192 @@ class StockReportEmail(Sensor):
                             daily_images.append(annotated_path)
                     except Exception as e:
                         LOGGER.error(f"Error annotating image {img_path}: {e}")
-            
-            # Send the report with workbook and images
-            await self.send_report(self.data, timestamp, daily_images)
-            
-            self.last_sent_date = date_str
-            self.last_sent_time = str(timestamp)
-            self.report = "sent"
-            self._save_state()
-            
-            LOGGER.info(f"Sent report for {date_str} with {len(daily_images)} images")
-        except Exception as e:
-            self.report = f"error: {str(e)}"
-            LOGGER.error(f"Failed to send report for {date_str}: {e}")
-    
-    async def process_and_send_report(self, timestamp, date_str):
-        """Process a workbook and send it as a report immediately."""
-        try:
-            workbook_path = await self.process_workbook(timestamp, date_str)
-            if workbook_path:
-                # Get daily images
-                daily_images = []
-                
-                if self.include_images:
-                    image_files = self._get_daily_images(date_str)
-                    
-                    # Annotate images
-                    for img_path in image_files:
-                        try:
-                            annotated_path = self.annotate_image(img_path)
-                            if annotated_path:
-                                daily_images.append(annotated_path)
-                        except Exception as e:
-                            LOGGER.error(f"Error annotating image {img_path}: {e}")
-                
-                # Send report with workbook and images
-                await self.send_report(workbook_path, timestamp, daily_images)
-                
-                self.last_sent_date = date_str
-                self.last_sent_time = str(timestamp)
-                self.report = "sent"
-                self._save_state()
-                
-                LOGGER.info(f"Processed and sent report for {date_str} with {len(daily_images)} images")
-                return {"status": "success", "message": f"Processed and sent report for {date_str} with {len(daily_images)} images"}
-            else:
-                self.report = "error: processing failed"
-                return {"status": "error", "message": "Processing failed"}
-        except Exception as e:
-            self.report = f"error: {str(e)}"
-            LOGGER.error(f"Failed to process/send report for {date_str}: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def send_report(self, workbook_path, timestamp, image_paths=None):
-        """
-        Send the report via email using SendGrid, including a workbook and optional images.
 
-        Args:
-            workbook_path: Path to the workbook file
-            timestamp: Datetime object representing the send time
-            image_paths: Optional list of paths to images to attach
-        """
+            await self.send_report(self.last_workbook_path, daily_images)
+            self.last_sent_time = now
+            self.total_reports_sent += 1
+            self.report_status = "sent"
+            self._save_state()
+            LOGGER.info(f"Sent email report for {date_str} with {len(daily_images)} images")
+
+        except Exception as e:
+            self.report_status = f"error: {str(e)}"
+            LOGGER.error(f"Failed to send report for {date_str}: {e}")
+            self._save_state()
+
+    async def send_report(self, workbook_path, image_paths=None):
+        """Send the report via email with images and workbook."""
         if not self.sendgrid_api_key:
             LOGGER.error("No SendGrid API key configured")
-            raise ValueError("No SendGrid API key configured")
-
-        if not os.path.exists(workbook_path):
-            LOGGER.error(f"Workbook file not found: {workbook_path}")
-            raise FileNotFoundError(f"Workbook file not found: {workbook_path}")
+            return
 
         try:
-            # Prepare email content
             LOGGER.info(f"Preparing report email with workbook: {os.path.basename(workbook_path)}")
-
-            # Updated email subject format
-            subject = f"Daily Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
-
-            # Base email text with single newlines (matching stock-alert style)
-            base_text = "The Excel workbook is attached with data for review.\n"
-            base_text += f"Location: {self.location}\n"
-
-            # Add image count if images are attached
-            if image_paths and len(image_paths) > 0:
-                base_text += f"Also attached are {len(image_paths)} images captured during the day.\n"
-
-            # Add teleop link if configured, with "here" as the clickable part
+            now = datetime.datetime.now()
+            subject = f"Daily Report: {now.strftime('%Y-%m-%d')} - {self.location}"
+            body_text = f"The Excel workbook is attached with data for review.\nLocation: {self.location}\n"
+            if image_paths:
+                body_text += f"Also attached are {len(image_paths)} images captured during the day.\n"
             if self.teleop_url and self.teleop_url != "#":
-                base_text += f"Click here for the link to a real-time view of the store: {self.teleop_url}"
+                body_text += f"Click here for the link to a real-time view of the store: {self.teleop_url}"
 
-            # Create email message
-            message = Mail(
-                from_email=Email(self.sender_email, self.sender_name),
-                to_emails=self.recipients,
-                subject=subject,
-                plain_text_content=Content("text/plain", base_text)
-            )
-
-            # Create HTML version with "here" as the hyperlink
-            html_content = f"""<html>
-    <body>
-    <p>The Excel workbook is attached with data for review.</p>
-    <p>Location: {self.location}</p>"""
-
-            if image_paths and len(image_paths) > 0:
-                html_content += f"""<p>Also attached are {len(image_paths)} images captured during the day.</p>"""
-
+            html_content = f"""<html><body><p>The Excel workbook is attached with data for review.</p><p>Location: {self.location}</p>"""
+            if image_paths:
+                html_content += f"<p>Also attached are {len(image_paths)} images captured during the day.</p>"
             if self.teleop_url and self.teleop_url != "#":
                 html_content += f"""<p>Click <a href="{self.teleop_url}">here</a> for the link to a real-time view of the store.</p>"""
+            html_content += "</body></html>"
 
-            html_content += """
-    </body>
-    </html>"""
+            valid_recipients = [r for r in self.recipients if isinstance(r, str) and '@' in r]
+            if not valid_recipients:
+                LOGGER.error("No valid recipients found")
+                return
 
+            message = Mail(
+                from_email=Email(self.sender_email, self.sender_name),
+                to_emails=valid_recipients,
+                subject=subject,
+                plain_text_content=Content("text/plain", body_text)
+            )
             message.add_content(Content("text/html", html_content))
 
-            # Sort and attach images first (latest to earliest)
-            if image_paths and len(image_paths) > 0:
-                # Sort images by timestamp in filename (assuming format YYYYMMDD_HHMMSS_*.jpg)
+            if image_paths:
                 def sort_by_timestamp(path):
-                    filename = os.path.basename(path)
-                    # Extract timestamp part (YYYYMMDD_HHMMSS) from filename
-                    parts = filename.split('_')
+                    parts = os.path.basename(path).split('_')
                     if len(parts) >= 2:
-                        timestamp_str = parts[0] + '_' + parts[1]  # Combine date and time parts
                         try:
-                            # Convert to datetime for sorting
-                            return datetime.datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                            return datetime.datetime.strptime(parts[0] + '_' + parts[1], "%Y%m%d_%H%M%S")
                         except ValueError:
-                            LOGGER.warning(f"Could not parse timestamp from {filename}, using filename as fallback")
-                            return filename
-                    return filename  # Fallback if parsing fails
+                            return path
+                    return path
 
-                # Sort image paths from latest to earliest (descending order)
-                sorted_image_paths = sorted(image_paths, key=sort_by_timestamp, reverse=True)
-
-                # Add sorted image attachments (latest to earliest)
-                for img_path in sorted_image_paths:
+                sorted_images = sorted(image_paths, key=sort_by_timestamp, reverse=True)
+                for img_path in sorted_images:
                     try:
                         with open(img_path, "rb") as f:
                             img_content = base64.b64encode(f.read()).decode()
-
                         img_name = os.path.basename(img_path)
-
-                        # Create image attachment
-                        img_attachment = Attachment()
-                        img_attachment.file_content = FileContent(img_content)
-                        img_attachment.file_name = FileName(img_name)
-                        img_attachment.file_type = FileType("image/jpeg")
-                        img_attachment.disposition = Disposition("attachment")
-
-                        # Add image attachment to message
+                        img_attachment = Attachment(
+                            FileContent(img_content), FileName(img_name), FileType("image/jpeg"), Disposition("attachment")
+                        )
                         message.add_attachment(img_attachment)
                         LOGGER.info(f"Added image attachment to report: {img_name}")
                     except Exception as e:
-                        LOGGER.error(f"Error attaching image to report: {img_path}: {e}")
+                        LOGGER.error(f"Error attaching image: {e}")
 
-            # Add the Excel workbook attachment last
             with open(workbook_path, "rb") as f:
-                file_content = base64.b64encode(f.read()).decode()
-
-            file_name = os.path.basename(workbook_path)
-
-            # Create workbook attachment
-            wb_attachment = Attachment()
-            wb_attachment.file_content = FileContent(file_content)
-            wb_attachment.file_name = FileName(file_name)
-            wb_attachment.file_type = FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            wb_attachment.disposition = Disposition("attachment")
-
-            # Add workbook attachment to message last
+                wb_content = base64.b64encode(f.read()).decode()
+            wb_name = os.path.basename(workbook_path)
+            wb_attachment = Attachment(
+                FileContent(wb_content), FileName(wb_name),
+                FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), Disposition("attachment")
+            )
             message.add_attachment(wb_attachment)
-            LOGGER.info(f"Added workbook attachment to report: {file_name}")
+            LOGGER.info(f"Added workbook attachment to report: {wb_name}")
 
-            # Send email
-            LOGGER.info(f"Sending report to {len(self.recipients)} recipients")
+            LOGGER.info(f"Sending email report to {len(valid_recipients)} recipients")
             sg = SendGridAPIClient(self.sendgrid_api_key)
             response = sg.send(message)
-
-            LOGGER.info(f"Report sent via SendGrid API. Status code: {response.status_code}")
-            return True
+            LOGGER.info(f"Email sent via SendGrid API. Status code: {response.status_code}")
 
         except Exception as e:
             LOGGER.error(f"Failed to send report: {e}")
-            raise
-    
-    async def get_readings(self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs) -> Dict[str, SensorReading]:
-        """Return the current state of the sensor for monitoring."""
+
+    async def get_readings(self, *, extra: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, SensorReading]:
+        """Get current sensor readings."""
         now = datetime.datetime.now()
         next_process = self._get_next_process_time(now)
         next_send = self._get_next_send_time(now)
-
-        # Only get next capture time if image capture is enabled
-        next_capture = None
-        if self.include_images:
-            next_capture = self._get_next_capture_time(now)
-
-        # Map store hours for display
-        store_hours = {
-            "weekdays": self.hours_weekdays,
-            "weekends": self.hours_weekends
-        }
+        next_capture = self._get_next_capture_time(now) if self.include_images else None
 
         readings = {
-            "last_processed_date": self.last_processed_date or "never",
-            "last_processed_time": self.last_processed_time or "never",
-            "last_sent_date": self.last_sent_date or "never",
-            "last_sent_time": self.last_sent_time or "never",
-            "last_workbook_path": self.data or "none",
-            "next_process_date": next_process.strftime("%Y%m%d"),
+            "location": self.location,
+            "last_processed_time": str(self.last_processed_time) if self.last_processed_time else "never",
+            "last_sent_time": str(self.last_sent_time) if self.last_sent_time else "never",
+            "last_workbook_path": self.last_workbook_path or "none",
+            "total_reports_sent": self.total_reports_sent,
+            "report_status": self.report_status,
+            "workbook_status": self.workbook_status,
             "next_process_time": str(next_process),
-            "next_send_date": next_send.strftime("%Y%m%d"),
             "next_send_time": str(next_send),
             "timezone": self.timezone,
-            "store_hours": store_hours,
-            "report": self.report,
-            "pid": os.getpid(),
-            "location": self.location
+            "hours_weekdays": self.hours_weekdays,
+            "hours_weekends": self.hours_weekends,
+            "pid": os.getpid()
         }
 
-        # Add image capture information if enabled
         if self.include_images:
             readings.update({
-                "image_capture": "enabled",
+                "include_images": True,
                 "camera_name": self.camera_name,
                 "capture_times": self.capture_times,
                 "last_capture_time": str(self.last_capture_time) if self.last_capture_time else "never",
                 "next_capture_time": str(next_capture) if next_capture else "none scheduled"
             })
         else:
-            readings["image_capture"] = "disabled"
+            readings["include_images"] = False
 
         return readings
-    
+
     async def do_command(self, command: Dict[str, Any], *, timeout: Optional[float] = None, **kwargs) -> Dict[str, Any]:
-        """Handle manual command execution."""
+        """Handle custom commands."""
         cmd = command.get("command", "")
-        
+
         if cmd == "process_and_send":
-            day = command.get("day", datetime.datetime.now().strftime("%Y%m%d"))
+            date = command.get("date", datetime.datetime.now().strftime("%Y%m%d"))
             try:
                 timestamp = datetime.datetime.strptime(day, "%Y%m%d")
-                result = await self.process_and_send_report(timestamp, day)
-                return result
+                await self.process_workbook()
+                await self.send_report_if_ready()
+                return {"status": "completed", "message": f"Processed and sent report for {day}"}
             except ValueError:
                 return {"status": "error", "message": f"Invalid day format: {day}, use YYYYMMDD"}
-                
+
         elif cmd == "process":
-            day = command.get("day", datetime.datetime.now().strftime("%Y%m%d"))
+            date = command.get("date", datetime.datetime.now().strftime("%Y%m%d"))
             try:
-                timestamp = datetime.datetime.strptime(day, "%Y%m%d")
-                final_path = await self.process_workbook(timestamp, day)
-                if final_path:
-                    return {"status": "success", "message": f"Processed workbook for {day}", "path": final_path}
-                else:
-                    return {"status": "error", "message": f"Failed to process workbook for {day}"}
+                await self.process_workbook()
+                return {"status": "completed", "message": f"Processed workbook for {day}", "path": self.last_workbook_path}
             except ValueError:
                 return {"status": "error", "message": f"Invalid day format: {day}, use YYYYMMDD"}
-                                
-        elif cmd == "capture_now":
+
+        elif cmd == "capture_image":
             if not self.include_images:
-                return {"status": "error", "message": "Image capture is disabled"}
-                
-            now = datetime.datetime.now()
-            image_path = await self.capture_image(now)
-            
-            if image_path:
-                return {
-                    "status": "success", 
-                    "message": f"Captured image at {now}",
-                    "path": image_path
-                }
-            else:
-                return {"status": "error", "message": "Failed to capture image"}
-                
+                return {"status": "error", "message": "Image capture not enabled"}
+            await self.capture_image()
+            return {"status": "completed", "message": f"Captured image at {datetime.datetime.now()}"}
+
         elif cmd == "test_email":
+            if not self.sendgrid_api_key:
+                return {"status": "error", "message": "No SendGrid API key configured"}
             try:
-                if not self.sendgrid_api_key:
-                    return {"status": "error", "message": "No SendGrid API key configured"}
-                    
-                # Create test email content
-                timestamp = datetime.datetime.now()
-                subject = f"Test Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
-                body = f"This is a test email from {self.name} at {self.location}.\nTime: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
-                
-                # Create email message
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                subject = f"Test Report from {self.location}"
+                body = f"This is a test report from {self.name} at {self.location}.\nTime: {timestamp}"
                 message = Mail(
                     from_email=Email(self.sender_email, self.sender_name),
                     to_emails=self.recipients,
                     subject=subject,
                     plain_text_content=Content("text/plain", body)
                 )
-                
-                # Add HTML content
                 html_body = body.replace("\n", "<br>")
                 message.add_content(Content("text/html", f"<html><body><p>{html_body}</p></body></html>"))
-                
-                # Send email
                 sg = SendGridAPIClient(self.sendgrid_api_key)
                 response = sg.send(message)
-                
-                return {
-                    "status": "success",
-                    "message": f"Test report email sent with status code {response.status_code}",
-                    "recipients": self.recipients
-                }
+                return {"status": "completed", "message": f"Test report sent with status code {response.status_code}"}
             except Exception as e:
-                return {"status": "error", "message": f"Failed to send test report email: {str(e)}"}
-        
+                return {"status": "error", "message": f"Failed to send test report: {str(e)}"}
+
         elif cmd == "get_schedule":
             now = datetime.datetime.now()
-            next_process = self._get_next_process_time(now)
-            next_send = self._get_next_send_time(now)
-            
-            response = {
-                "status": "success",
+            return {
+                "status": "completed",
                 "process_time": self.process_time,
                 "send_time": self.send_time,
-                "next_process": str(next_process),
-                "next_send": str(next_send),
-                "timezone": self.timezone
+                "next_process": str(self._get_next_process_time(now)),
+                "next_send": str(self._get_next_send_time(now)),
+                "capture_times": self.capture_times if self.include_images else [],
+                "next_capture": str(self._get_next_capture_time(now)) if self.include_images else "none scheduled"
             }
-            
-            if self.include_images:
-                next_capture = self._get_next_capture_time(now)
-                response.update({
-                    "capture_times": self.capture_times,
-                    "next_capture": str(next_capture)
-                })
-                
-            return response
-            
-        else:
-            return {"status": "error", "message": f"Unknown command: {cmd}"}
+
+        return {"status": "error", "message": f"Unknown command: {cmd}"}
