@@ -16,7 +16,7 @@ LOGGER = logging.getLogger(__name__)
 class DataExporter:
     """
     A simplified version of vde.py data exporter, specifically tailored for
-    exporting workbook data from the Viam Data API, now with image retrieval support.
+    exporting workbook data from the Viam Data API.
     """
     
     def __init__(self, api_key_id, api_key, org_id, location_id, timezone="America/New_York"):
@@ -179,108 +179,6 @@ class DataExporter:
             
         finally:
             client.close()
-    
-    async def get_closest_images(self, component_name, start_time, end_time, desired_times, window_minutes=5):
-        """
-        Retrieve images closest to the specified times from Viam Data Management.
-        
-        Args:
-            component_name: Name of the component (e.g., "ffmpeg")
-            start_time: Start of the time range (datetime with timezone)
-            end_time: End of the time range (datetime with timezone)
-            desired_times: List of datetime objects with timezone for desired image times
-            window_minutes: Minutes before and after desired time to search
-                
-        Returns:
-            List of tuples: [(desired_time, BinaryData or None), ...]
-        """
-        # Initialize default result with None values
-        result = [(dt, None) for dt in desired_times]
-        
-        # Create a fresh connection specifically for image retrieval
-        client = None
-        try:
-            LOGGER.info("Creating fresh connection for image retrieval")
-            dial_options = DialOptions(
-                credentials=Credentials(
-                    type="api-key",
-                    payload=self.api_key,
-                ),
-                auth_entity=self.api_key_id
-            )
-            client = await ViamClient.create_from_dial_options(dial_options)
-            data_client = client.data_client
-            
-            if not data_client:
-                LOGGER.error("Failed to create data client for image retrieval")
-                return result
-                
-            # Process each desired time individually
-            for i, desired_time in enumerate(desired_times):
-                try:
-                    # Create time window around desired time
-                    window_delta = timedelta(minutes=window_minutes)
-                    window_start = desired_time - window_delta
-                    window_end = desired_time + window_delta
-                    
-                    # Ensure window is within overall time range
-                    window_start = max(window_start, start_time)
-                    window_end = min(window_end, end_time)
-                    
-                    # Convert to UTC for API
-                    start_time_utc = window_start.astimezone(pytz.utc)
-                    end_time_utc = window_end.astimezone(pytz.utc)
-                    
-                    # Create timestamp objects
-                    start_ts = Timestamp()
-                    start_ts.FromDatetime(start_time_utc)
-                    end_ts = Timestamp()
-                    end_ts.FromDatetime(end_time_utc)
-                    
-                    # Create filter for this specific time window
-                    capture_interval = CaptureInterval(start=start_ts, end=end_ts)
-                    filter = Filter(
-                        component_name=component_name,
-                        method="ReadImage",
-                        interval=capture_interval,
-                        organization_ids=[self.org_id]
-                    )
-                    
-                    LOGGER.info(f"Searching for image at {desired_time.strftime('%H:%M')} (window: ±{window_minutes} min)")
-                    
-                    # Query images for this time window
-                    images, count, _ = await data_client.binary_data_by_filter(
-                        filter=filter,
-                        include_binary_data=True,  # Get binary data directly
-                        limit=1,  # Just get the closest one
-                        sort_order=Order.ORDER_ASCENDING
-                    )
-                    
-                    if images and len(images) > 0:
-                        # Store the image in the result
-                        result[i] = (desired_time, images[0])
-                        LOGGER.info(f"Found image for {desired_time.strftime('%H:%M')}")
-                    else:
-                        LOGGER.warning(f"No image found for {desired_time.strftime('%H:%M')} (searched {start_time_utc} to {end_time_utc})")
-                        
-                except Exception as e:
-                    LOGGER.error(f"Error retrieving image for {desired_time.strftime('%H:%M')}: {e}")
-                    # Continue with next time even if this one fails
-            
-            return result
-            
-        except Exception as e:
-            LOGGER.error(f"Error in get_closest_images: {e}")
-            return result
-            
-        finally:
-            # Always close the client
-            if client:
-                try:
-                    await client.close()
-                    LOGGER.info("Closed image retrieval connection")
-                except Exception as e:
-                    LOGGER.error(f"Error closing client: {e}")
 
     def _floor_timestamp(self, ts, bucket_td):
         """Round a timestamp down to the nearest bucket interval."""

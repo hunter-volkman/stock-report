@@ -1290,16 +1290,7 @@ class StockReportEmail(Sensor):
                     return {"status": "error", "message": f"Failed to process workbook for {day}"}
             except ValueError:
                 return {"status": "error", "message": f"Invalid day format: {day}, use YYYYMMDD"}
-                
-        elif cmd == "send":
-            day = command.get("day", datetime.datetime.now().strftime("%Y%m%d"))
-            try:
-                timestamp = datetime.datetime.strptime(day, "%Y%m%d")
-                await self.send_processed_workbook(timestamp, day)
-                return {"status": "success", "message": f"Sent processed workbook for {day}"}
-            except ValueError:
-                return {"status": "error", "message": f"Invalid day format: {day}, use YYYYMMDD"}
-                
+                                
         elif cmd == "capture_now":
             if not self.include_images:
                 return {"status": "error", "message": "Image capture is disabled"}
