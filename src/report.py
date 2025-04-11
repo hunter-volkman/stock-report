@@ -490,28 +490,34 @@ class StockReportEmail(Sensor):
             return None
             
         try:
-            # Find camera in dependencies - flexible approach like stock-alert
+            # Try to find any resource that could be a camera, with much more flexibility
             camera = None
             for name, resource in self.dependencies.items():
-                if isinstance(resource, Camera):
-                    # Check if the camera name is in the resource name (case-insensitive)
-                    if self.camera_name.lower() in str(name).lower():
+                # Accept any resource that has a get_image method
+                if hasattr(resource, 'get_image'):
+                    # If camera_name is specified, try to match it
+                    if not self.camera_name or self.camera_name.lower() in str(name).lower():
                         camera = resource
                         LOGGER.info(f"Found camera: {name}")
                         break
             
             if not camera:
-                LOGGER.warning(f"Camera '{self.camera_name}' not found in dependencies, disabling image capture")
+                LOGGER.warning(f"No usable camera found in dependencies")
                 return None
             
             # Continue with image capture...
-            LOGGER.info(f"Capturing image from camera '{self.camera_name}'")
+            LOGGER.info(f"Capturing image from camera")
             
             # Capture image with retry logic
             for attempt in range(3):
                 try:
-                    # Capture image
-                    image = await camera.get_image(mime_type="image/jpeg")
+                    # Capture image - wrapped in a try block for resilience
+                    try:
+                        image = await camera.get_image(mime_type="image/jpeg")
+                    except Exception as e:
+                        # Fallback to get_image without mime_type if needed
+                        LOGGER.warning(f"Failed to get image with mime_type, trying without: {e}")
+                        image = await camera.get_image()
                     
                     # Get the image data
                     today_str = now.strftime("%Y%m%d")
@@ -524,20 +530,30 @@ class StockReportEmail(Sensor):
                     
                     image_path = os.path.join(daily_dir, filename)
                     
-                    # Handle different image types (like in stock-alert)
-                    if hasattr(image, 'data'):
+                    # Handle different image types with maximum flexibility
+                    saved = False
+                    if hasattr(image, 'data') and image.data:
                         # Use PIL to process image.data
-                        pil_image = Image.open(BytesIO(image.data))
-                        pil_image.save(image_path, "JPEG")
-                    elif isinstance(image, bytes):
+                        try:
+                            pil_image = Image.open(BytesIO(image.data))
+                            pil_image.save(image_path, "JPEG")
+                            saved = True
+                        except Exception as img_err:
+                            LOGGER.warning(f"Failed to process image.data: {img_err}")
+                            
+                    if not saved and isinstance(image, bytes):
                         # Direct bytes
                         with open(image_path, "wb") as f:
                             f.write(image)
-                    elif isinstance(image, dict) and 'data' in image:
+                        saved = True
+                            
+                    if not saved and isinstance(image, dict) and 'data' in image and image['data']:
                         # Dict with data
                         with open(image_path, "wb") as f:
                             f.write(image['data'])
-                    else:
+                        saved = True
+                    
+                    if not saved:
                         LOGGER.warning(f"Unsupported image type: {type(image)}") 
                         if attempt < 2:
                             await asyncio.sleep(2)
