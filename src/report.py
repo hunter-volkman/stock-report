@@ -790,7 +790,7 @@ class StockReportEmail(Sensor):
         if not self.sendgrid_api_key:
             LOGGER.error("No SendGrid API key configured")
             raise ValueError("No SendGrid API key configured")
-        
+    
         if not os.path.exists(workbook_path):
             LOGGER.error(f"Workbook file not found: {workbook_path}")
             raise FileNotFoundError(f"Workbook file not found: {workbook_path}")
@@ -814,100 +814,119 @@ class StockReportEmail(Sensor):
     </body>
     </html>"""
             
+            # Add images if configured
+            attached_images = []
             if self.image_times:
                 target_date = datetime.datetime.strptime(self.last_processed_date, "%Y%m%d").date()
                 local_tz = tz.gettz(self.timezone)
-                desired_times = []
-                for time_str in self.image_times:
-                    hour, minute = map(int, time_str.split(':'))
-                    dt_local = datetime.datetime.combine(target_date, datetime.time(hour, minute), tzinfo=local_tz)
-                    desired_times.append(dt_local)
-
-                opening_time, closing_time = self._get_store_hours_for_date(target_date)
-                open_hour, open_minute = map(int, opening_time.split(':'))
-                close_hour, close_minute = map(int, closing_time.split(':'))
-                start_time = datetime.datetime.combine(target_date, datetime.time(open_hour, open_minute), tzinfo=local_tz)
-                end_time = datetime.datetime.combine(target_date, datetime.time(close_hour, close_minute), tzinfo=local_tz)
-
+                
+                # Create a new client connection specifically for image retrieval
+                LOGGER.info("Creating new connection for image retrieval")
                 exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.location_id, self.timezone)
-                LOGGER.info("Attempting to connect to Viam API for image retrieval")
                 client = await exporter.connect()
                 
-                if client is None:
-                    LOGGER.error("Failed to connect to Viam API for image retrieval")
-                else:
+                if client and client.data_client:
                     try:
-                        # Make sure data_client is properly set
-                        if client.data_client is not None:
-                            exporter.data_client = client.data_client
-                            LOGGER.info(f"Fetching images for times: {', '.join(self.image_times)}")
-                            
+                        # Get store hours and convert image times to datetime objects
+                        opening_time, closing_time = self._get_store_hours_for_date(target_date)
+                        open_hour, open_minute = map(int, opening_time.split(':'))
+                        close_hour, close_minute = map(int, closing_time.split(':'))
+                        
+                        start_time = datetime.datetime.combine(target_date, datetime.time(open_hour, open_minute), tzinfo=local_tz)
+                        end_time = datetime.datetime.combine(target_date, datetime.time(close_hour, close_minute), tzinfo=local_tz)
+                        
+                        desired_times = []
+                        for time_str in self.image_times:
+                            hour, minute = map(int, time_str.split(':'))
+                            dt_local = datetime.datetime.combine(target_date, datetime.time(hour, minute), tzinfo=local_tz)
+                            desired_times.append(dt_local)
+                        
+                        LOGGER.info(f"Fetching images for times: {', '.join(self.image_times)}")
+                        
+                        # Retrieve images one by one instead of all at once
+                        images_dir = os.path.join(self.state_dir, "images")
+                        os.makedirs(images_dir, exist_ok=True)
+                        
+                        for dt_local in desired_times:
                             try:
-                                images = await exporter.get_closest_images(
+                                # Create filter for this specific time
+                                from viam.proto.app.data import CaptureInterval, Order, Filter
+                                from google.protobuf.timestamp_pb2 import Timestamp
+                                
+                                # Target 5 minutes before and after the desired time
+                                start_dt = dt_local - datetime.timedelta(minutes=5)
+                                end_dt = dt_local + datetime.timedelta(minutes=5)
+                                
+                                start_ts = Timestamp()
+                                start_ts.FromDatetime(start_dt.astimezone(pytz.utc))
+                                end_ts = Timestamp()
+                                end_ts.FromDatetime(end_dt.astimezone(pytz.utc))
+                                
+                                capture_interval = CaptureInterval(start=start_ts, end=end_ts)
+                                filter = Filter(
                                     component_name="ffmpeg",
-                                    start_time=start_time,
-                                    end_time=end_time,
-                                    desired_times=desired_times
+                                    method="ReadImage",
+                                    interval=capture_interval,
+                                    organization_ids=[self.org_id]
                                 )
-
-                                if images:  # Make sure we have some results
-                                    attached_images = []
-                                    images_dir = os.path.join(self.state_dir, "images")
-                                    os.makedirs(images_dir, exist_ok=True)  # Ensure images directory exists
                                 
-                                for dt_local, binary_data in images:
-                                    if binary_data:
-                                        try:
-                                            # Save binary data to a temporary file
-                                            time_str = dt_local.strftime("%H%M")
-                                            temp_image_path = os.path.join(images_dir, f"image_{time_str}.jpg")
-                                            with open(temp_image_path, "wb") as f:
-                                                f.write(binary_data.binary)
-                                            LOGGER.debug(f"Saved image to {temp_image_path}")
-
-                                            # Read and encode the file for attachment
-                                            with open(temp_image_path, "rb") as f:
-                                                file_content = base64.b64encode(f.read()).decode()
-                                            
-                                            filename = f"image_{time_str}.jpg"
-                                            mime_type = "image/jpeg"  # Hardcoded as in send_alert
-                                            attachment = Attachment()
-                                            attachment.file_content = FileContent(file_content)
-                                            attachment.file_name = FileName(filename)
-                                            attachment.file_type = FileType(mime_type)
-                                            attachment.disposition = Disposition("attachment")
-                                            message.add_attachment(attachment)
-                                            attached_images.append(f"{filename} ({dt_local.strftime('%H:%M')})")
-                                            
-                                            # Clean up temporary file
-                                            os.remove(temp_image_path)
-                                            LOGGER.debug(f"Removed temporary image file: {temp_image_path}")
-                                        except Exception as e:
-                                            LOGGER.error(f"Error processing image for {dt_local}: {e}")
-                                            continue  # Skip this image, continue with others
+                                LOGGER.info(f"Looking for image around {dt_local.strftime('%H:%M')}")
                                 
-                                if attached_images:
-                                    images_text = "Attached images:\n" + "\n".join(attached_images)
-                                    body_text += "\n\n" + images_text
-                                    html_content = html_content.replace("</body>", f"<p>Attached images:<br>{'<br>'.join(attached_images)}</p></body>")
+                                # Get images within this time window
+                                images, _, _ = await client.data_client.binary_data_by_filter(
+                                    filter=filter,
+                                    include_binary_data=True,
+                                    limit=1,
+                                    sort_order=Order.ORDER_ASCENDING
+                                )
+                                
+                                if images and len(images) > 0:
+                                    # Save image to disk
+                                    time_str = dt_local.strftime("%H%M")
+                                    temp_image_path = os.path.join(images_dir, f"image_{time_str}.jpg")
+                                    
+                                    with open(temp_image_path, "wb") as f:
+                                        f.write(images[0].binary)
+                                    
+                                    LOGGER.info(f"Saved image for {time_str} to {temp_image_path}")
+                                    
+                                    # Attach to email
+                                    with open(temp_image_path, "rb") as f:
+                                        file_content = base64.b64encode(f.read()).decode()
+                                    
+                                    filename = f"image_{time_str}.jpg"
+                                    attachment = Attachment()
+                                    attachment.file_content = FileContent(file_content)
+                                    attachment.file_name = FileName(filename)
+                                    attachment.file_type = FileType("image/jpeg")
+                                    attachment.disposition = Disposition("attachment")
+                                    message.add_attachment(attachment)
+                                    
+                                    attached_images.append(f"{filename} ({dt_local.strftime('%H:%M')})")
+                                    LOGGER.info(f"Added image attachment: {filename}")
+                                else:
+                                    LOGGER.warning(f"No images found for time {dt_local.strftime('%H:%M')}")
                             
                             except Exception as e:
-                                LOGGER.error(f"Error retrieving images: {e}")
-                                images = [(dt, None) for dt in desired_times]  # Provide empty results
-                        else:
-                            LOGGER.error("Data client is None after connection")
-                    
+                                LOGGER.error(f"Error retrieving image for {dt_local.strftime('%H:%M')}: {e}")
+                        
                     except Exception as e:
-                        LOGGER.error(f"Failed to retrieve or attach images: {e}")
+                        LOGGER.error(f"Error in image retrieval process: {e}")
                     finally:
-                        if client is not None:
-                            LOGGER.info("Closing Viam API client connection")
-                            await client.close()
-                        else:
-                            LOGGER.warning("Client is None, skipping close operation")
-
+                        # Always close the client when done
+                        await client.close()
+                else:
+                    LOGGER.error("Failed to create client for image retrieval")
+            
+            # Update email content with image information
+            if attached_images:
+                images_text = "Attached images:\n" + "\n".join(attached_images)
+                body_text += "\n\n" + images_text
+                html_content = html_content.replace("</body>", f"<p>Attached images:<br>{'<br>'.join(attached_images)}</p></body>")
+            
             message.add_content(Content("text/html", html_content))
             
+            # Attach the workbook
             with open(workbook_path, "rb") as f:
                 file_content = base64.b64encode(f.read()).decode()
             
@@ -919,6 +938,7 @@ class StockReportEmail(Sensor):
             attachment.disposition = Disposition("attachment")
             message.add_attachment(attachment)
             
+            # Send the email
             LOGGER.info(f"Sending email to {len(self.recipients)} recipients")
             sg = SendGridAPIClient(self.sendgrid_api_key)
             response = sg.send(message)
