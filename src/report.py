@@ -93,14 +93,9 @@ class StockReportEmail(Sensor):
                     datetime.datetime.strptime(time_str, "%H:%M")
                 except ValueError:
                     raise ValueError(f"Invalid capture_times entry '{time_str}': must be in 'HH:MM' format")
-                    
-        # Check if camera is specified when include_images is true
-        include_images = attributes.get("include_images", False)
-        if include_images and not attributes.get("camera_name"):
-            raise ValueError("camera_name must be specified when include_images is true")
-            
-        # Similar to stock-alert pattern, don't require explicit dependencies
-        # This prevents the "unresolved dependencies" error
+        
+        # Log validation completion but don't require any dependencies
+        # This matching the working pattern in stock-alert module
         LOGGER.info(f"StockReportEmail.validate_config completed for {config.name}")
         return []
     
@@ -296,12 +291,36 @@ class StockReportEmail(Sensor):
         
         self.timezone = attributes.get("timezone", "America/New_York")
         
-        # Image capture configuration
+        # Image capture configuration - updated for more resilience
         self.include_images = attributes.get("include_images", False)
         if isinstance(self.include_images, str):
             self.include_images = self.include_images.lower() == "true"
-            
+        
+        # Camera configuration
         self.camera_name = attributes.get("camera_name", "")
+        # If image capture is enabled but no camera specified, log a warning
+        if self.include_images and not self.camera_name:
+            LOGGER.warning("Image capture enabled but no camera_name specified")
+            # Will attempt to find first available camera at runtime
+            
+        # Check dependencies to see if we actually have a camera
+        has_camera = False
+        if self.include_images:
+            # Check if any camera is available in dependencies
+            for name, resource in self.dependencies.items():
+                if isinstance(resource, Camera):
+                    has_camera = True
+                    # If no camera name specified, use the first one found
+                    if not self.camera_name:
+                        self.camera_name = str(name)
+                        LOGGER.info(f"No camera specified, using first found camera: {name}")
+                    break
+            
+            # Log warning if no camera found but don't disable images
+            # Will try to find camera again during capture
+            if not has_camera:
+                LOGGER.warning(f"No camera found in dependencies yet")
+        
         self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
         self.image_width = int(attributes.get("image_width", 640))
         self.image_height = int(attributes.get("image_height", 480))
@@ -470,77 +489,76 @@ class StockReportEmail(Sensor):
         if not self.include_images:
             return None
             
-        # Try to find camera in dependencies or as a remote resource
-        camera = None
-        
-        # First, look for camera directly in dependencies
-        camera_name = self.camera_name
-        camera_parts = camera_name.split(':')
-        
-        # Try to find based on camera name (exact or partial match)
-        for name, resource in self.dependencies.items():
-            if isinstance(resource, Camera):
-                res_name_str = str(name)
-                # Check for exact match or if camera_name is a substring of resource name
-                if res_name_str == camera_name or camera_name in res_name_str:
-                    camera = resource
-                    LOGGER.info(f"Found camera: {name}")
-                    break
-        
-        if not camera:
-            LOGGER.warning(f"Camera '{self.camera_name}' not found in dependencies")
-            return None
+        try:
+            # Find camera in dependencies - flexible approach like stock-alert
+            camera = None
+            for name, resource in self.dependencies.items():
+                if isinstance(resource, Camera):
+                    # Check if the camera name is in the resource name (case-insensitive)
+                    if self.camera_name.lower() in str(name).lower():
+                        camera = resource
+                        LOGGER.info(f"Found camera: {name}")
+                        break
             
-        # Try to capture image with retry logic
-        for attempt in range(3):
-            try:
-                LOGGER.info(f"Capturing image from camera '{self.camera_name}' (attempt {attempt + 1})")
+            if not camera:
+                LOGGER.warning(f"Camera '{self.camera_name}' not found in dependencies, disabling image capture")
+                return None
+            
+            # Continue with image capture...
+            LOGGER.info(f"Capturing image from camera '{self.camera_name}'")
+            
+            # Capture image with retry logic
+            for attempt in range(3):
+                try:
+                    # Capture image
+                    image = await camera.get_image(mime_type="image/jpeg")
+                    
+                    # Get the image data
+                    today_str = now.strftime("%Y%m%d")
+                    timestamp = now.strftime("%Y%m%d_%H%M%S")
+                    filename = f"{timestamp}_{self.name}.jpg"
+                    
+                    # Create daily directory
+                    daily_dir = os.path.join(self.images_dir, today_str)
+                    os.makedirs(daily_dir, exist_ok=True)
+                    
+                    image_path = os.path.join(daily_dir, filename)
+                    
+                    # Handle different image types (like in stock-alert)
+                    if hasattr(image, 'data'):
+                        # Use PIL to process image.data
+                        pil_image = Image.open(BytesIO(image.data))
+                        pil_image.save(image_path, "JPEG")
+                    elif isinstance(image, bytes):
+                        # Direct bytes
+                        with open(image_path, "wb") as f:
+                            f.write(image)
+                    elif isinstance(image, dict) and 'data' in image:
+                        # Dict with data
+                        with open(image_path, "wb") as f:
+                            f.write(image['data'])
+                    else:
+                        LOGGER.warning(f"Unsupported image type: {type(image)}") 
+                        if attempt < 2:
+                            await asyncio.sleep(2)
+                            continue
+                        return None
+                    
+                    self.last_capture_time = now
+                    LOGGER.info(f"Saved image to {image_path}")
+                    return image_path
                 
-                # Capture image
-                image = await camera.get_image(mime_type="image/jpeg")
-                
-                # Get the image data
-                today_str = now.strftime("%Y%m%d")
-                timestamp = now.strftime("%Y%m%d_%H%M%S")
-                filename = f"{timestamp}_{self.name}.jpg"
-                
-                # Create daily directory
-                daily_dir = os.path.join(self.images_dir, today_str)
-                os.makedirs(daily_dir, exist_ok=True)
-                
-                image_path = os.path.join(daily_dir, filename)
-                
-                # Handle the image data depending on its type
-                if hasattr(image, 'data'):
-                    # Use PIL to process image.data
-                    pil_image = Image.open(BytesIO(image.data))
-                    pil_image.save(image_path, "JPEG")
-                elif isinstance(image, bytes):
-                    # Direct bytes
-                    with open(image_path, "wb") as f:
-                        f.write(image)
-                elif isinstance(image, dict) and 'data' in image:
-                    # Dict with data
-                    with open(image_path, "wb") as f:
-                        f.write(image['data'])
-                else:
-                    LOGGER.warning(f"Unsupported image type: {type(image)}")
+                except Exception as e:
+                    LOGGER.error(f"Error capturing image (attempt {attempt + 1}): {e}")
                     if attempt < 2:
                         await asyncio.sleep(2)
-                        continue
-                    return None
-                    
-                self.last_capture_time = now
-                LOGGER.info(f"Saved image to {image_path}")
-                return image_path
-                
-            except Exception as e:
-                LOGGER.error(f"Error capturing image (attempt {attempt + 1}): {e}")
-                if attempt < 2:
-                    await asyncio.sleep(2)
-                else:
-                    LOGGER.error("All capture attempts failed")
-                    return None
+                    else:
+                        LOGGER.error("All capture attempts failed")
+                        return None
+        
+        except Exception as e:
+            LOGGER.error(f"Fatal error in capture_image: {e}")
+            return None
     
     def annotate_image(self, image_path, font_size=20):
         """Annotate an image with timestamp and location information."""
