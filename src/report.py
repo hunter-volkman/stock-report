@@ -20,7 +20,7 @@ from viam.logging import getLogger
 from dateutil import tz
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import (
-    Mail, Attachment, FileContent, FileName, 
+    Mail, Attachment, FileContent, FileName,
     FileType, Disposition, Email, Content
 )
 import base64
@@ -33,8 +33,8 @@ LOGGER = getLogger(__name__)
 
 class StockReportEmail(Sensor):
     """
-    StockReportEmail component that generates and emails Excel workbook reports
-    with captured images based on scheduled times from Viam API data.
+    StockReportEmail component that generates and emails reports
+    containing Excel workbooks and captured images based on scheduled times from Viam API data.
     """
     
     MODEL = Model(ModelFamily("hunter", "stock-report"), "email")
@@ -50,20 +50,20 @@ class StockReportEmail(Sensor):
     def validate_config(cls, config: ComponentConfig) -> list[str]:
         """Validate the configuration and return required dependencies."""
         attributes = struct_to_dict(config.attributes)
-        
+
         # Check required attributes
-        required = ["location", "recipients", "api_key_id", "api_key", "org_id", "sendgrid_api_key", "filename_prefix"]
+        required = ["location", "recipients", "api_key_id", "api_key", "org_id", "sendgrid_api_key"]
         for attr in required:
             if attr not in attributes:
                 raise ValueError(f"{attr} is required")
-        
+
         # Validate send_time
         send_time = attributes.get("send_time", "20:00")
         try:
             datetime.datetime.strptime(str(send_time), "%H:%M")
         except ValueError:
             raise ValueError(f"Invalid send_time '{send_time}': must be in 'HH:MM' format")
-            
+
         # Validate process_time if provided
         process_time = attributes.get("process_time")
         if process_time:
@@ -73,19 +73,20 @@ class StockReportEmail(Sensor):
                 raise ValueError(f"Invalid process_time '{process_time}': must be in 'HH:MM' format")
 
         # Validate store hours
-        for day in ["hours_mon", "hours_tue", "hours_wed", "hours_thu", "hours_fri", "hours_sat", "hours_sun"]:
-            if day in attributes:
-                hours = attributes[day]
-                if not isinstance(hours, list) or len(hours) != 2:
-                    raise ValueError(f"'{day}' must be a list with two elements: [opening_time, closing_time]")
-                
-                # Validate each time string
-                for time_str in hours:
-                    try:
-                        datetime.datetime.strptime(str(time_str), "%H:%M")
-                    except ValueError:
-                        raise ValueError(f"Invalid time format in '{day}': '{time_str}' - must be in 'HH:MM' format")
-        
+        for hours_key in ["hours_weekdays", "hours_weekends"]:
+            if hours_key not in attributes:
+                raise ValueError(f"{hours_key} is required")
+            hours = attributes[hours_key]
+            if not isinstance(hours, list) or len(hours) != 2:
+                raise ValueError(f"'{hours_key}' must be a list with two elements: [opening_time, closing_time]")
+
+            # Validate each time string
+            for time_str in hours:
+                try:
+                    datetime.datetime.strptime(str(time_str), "%H:%M")
+                except ValueError:
+                    raise ValueError(f"Invalid time format in '{hours_key}': '{time_str}' - must be in 'HH:MM' format")
+
         # Validate capture_times if provided
         if "capture_times" in attributes:
             for time_str in attributes["capture_times"]:
@@ -93,39 +94,37 @@ class StockReportEmail(Sensor):
                     datetime.datetime.strptime(time_str, "%H:%M")
                 except ValueError:
                     raise ValueError(f"Invalid capture_times entry '{time_str}': must be in 'HH:MM' format")
-        
-        # Log validation completion but don't require any dependencies
-        # This matching the working pattern in stock-alert module
+
+        # Log validation completion
         LOGGER.info(f"StockReportEmail.validate_config completed for {config.name}")
         return []
     
     def __init__(self, name: str):
-        """Initialize the workbook report email component."""
+        """Initialize the report email component."""
         super().__init__(name)
         self.dependencies = {}
         self.config = None
-        
+
         # Base configuration
         self.location = ""
-        self.filename_prefix = ""
         self.teleop_url = ""
-        
+
         # Email configuration
         self.sendgrid_api_key = ""
         self.sender_email = "no-reply@viam.com"
-        self.sender_name = "Workbook Report"
+        self.sender_name = "Workbook Report"  # Consider updating to "Store Report" if desired
         self.recipients = []
-        
+
         # API configuration
         self.api_key_id = ""
         self.api_key = ""
         self.org_id = ""
-        
+
         # Scheduling
         self.send_time = "20:00"
         self.process_time = "19:00"  # Default to 1 hour before send
         self.timezone = "America/New_York"
-        
+
         # Image capture configuration
         self.include_images = False
         self.camera_name = ""
@@ -133,41 +132,36 @@ class StockReportEmail(Sensor):
         self.last_capture_time = None
         self.image_width = 640
         self.image_height = 480
-        
+
         # Store hours
-        self.hours_mon = ["07:00", "19:30"]
-        self.hours_tue = ["07:00", "19:30"]
-        self.hours_wed = ["07:00", "19:30"]
-        self.hours_thu = ["07:00", "19:30"]
-        self.hours_fri = ["07:00", "19:30"]
-        self.hours_sat = ["08:00", "17:00"]
-        self.hours_sun = ["08:00", "17:00"]
-        
+        self.hours_weekdays = ["07:00", "19:30"]  # Default for weekdays (Mon-Fri)
+        self.hours_weekends = ["08:00", "17:00"]  # Default for weekends (Sat-Sun)
+
         # State
         self.last_processed_date = None
         self.last_processed_time = None
         self.last_sent_date = None
         self.last_sent_time = None
-        self.data = None  # Path to the latest report file
-        self.report = "not_sent"
-        self.workbook = "not_processed"
-        
+        self.data = None  # Path to the latest workbook file
+        self.report = "not_sent"  # Status of the last report email
+        self.workbook = "not_processed"  # Status of the last workbook processing
+
         # Background tasks
         self.loop_task = None
         self.capture_task = None
-        
-        # State persistence - Similar to stock-alert module
+
+        # State persistence
         self.state_dir = os.path.join(os.path.expanduser("~"), ".stock-report")
         self.state_file = os.path.join(self.state_dir, f"{name}.json")
         self.workbooks_dir = os.path.join(self.state_dir, "workbooks")
         self.images_dir = os.path.join(self.state_dir, "images")
         self.lock_file = f"{self.state_file}.lock"
-        
+
         # Create necessary directories
         os.makedirs(self.state_dir, exist_ok=True)
         os.makedirs(self.workbooks_dir, exist_ok=True)
         os.makedirs(self.images_dir, exist_ok=True)
-        
+
         # Load persisted state
         self._load_state()
         LOGGER.info(f"Initialized with PID: {os.getpid()}")
@@ -254,7 +248,6 @@ class StockReportEmail(Sensor):
 
         # Base configuration
         self.location = config.attributes.fields["location"].string_value
-        self.filename_prefix = attributes.get("filename_prefix", "")
         self.teleop_url = attributes.get("teleop_url", "")
 
         # Email configuration
@@ -300,35 +293,27 @@ class StockReportEmail(Sensor):
         # Check dependencies to see if we actually have a camera
         if self.include_images:
             has_camera = False
-            # Use a flexible check (supports remote cameras) via getattr() method check
             for name, resource in self.dependencies.items():
-                if hasattr(resource, "get_image"):
+                if hasattr(resource, 'get_image'):
                     if self.camera_name:
-                        # Match if the configured name is a substring of the dependency name
                         if self.camera_name.lower() in str(name).lower():
                             has_camera = True
                             break
                     else:
-                        # No camera name specified; use the first available camera
                         self.camera_name = str(name)
                         has_camera = True
                         LOGGER.info(f"No camera specified, using first found camera: {name}")
                         break
             if not has_camera:
                 LOGGER.warning("No camera found in dependencies yet")
-        
+
         self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
         self.image_width = int(attributes.get("image_width", 640))
         self.image_height = int(attributes.get("image_height", 480))
 
         # Store hours
-        self.hours_mon = attributes.get("hours_mon", ["07:00", "19:30"])
-        self.hours_tue = attributes.get("hours_tue", ["07:00", "19:30"])
-        self.hours_wed = attributes.get("hours_wed", ["07:00", "19:30"])
-        self.hours_thu = attributes.get("hours_thu", ["07:00", "19:30"])
-        self.hours_fri = attributes.get("hours_fri", ["07:00", "19:30"])
-        self.hours_sat = attributes.get("hours_sat", ["08:00", "17:00"])
-        self.hours_sun = attributes.get("hours_sun", ["08:00", "17:00"])
+        self.hours_weekdays = attributes.get("hours_weekdays", ["07:00", "19:30"])
+        self.hours_weekends = attributes.get("hours_weekends", ["08:00", "17:00"])
 
         # Log configuration details
         LOGGER.info(f"Configured {self.name} for location '{self.location}'")
@@ -353,7 +338,6 @@ class StockReportEmail(Sensor):
         # Start scheduled tasks
         self.loop_task = asyncio.create_task(self.run_scheduled_loop())
 
-        
     def _get_next_process_time(self, now: datetime.datetime) -> datetime.datetime:
         """Calculate the next process time based on current time and process_time."""
         today = now.date()
@@ -398,7 +382,7 @@ class StockReportEmail(Sensor):
                                             datetime.datetime.strptime(self.capture_times[0], "%H:%M").time())
     
     async def run_scheduled_loop(self):
-        """Run a scheduled loop that wakes up for processing and sending times."""
+        """Run a scheduled loop that wakes up for processing and sending reports."""
         lock = fasteners.InterProcessLock(self.lock_file)
         if not lock.acquire(blocking=False):
             LOGGER.info(f"Another instance running, exiting (PID {os.getpid()})")
@@ -468,7 +452,7 @@ class StockReportEmail(Sensor):
                 if (now.hour == send_time_today.hour and 
                     now.minute == send_time_today.minute and 
                     self.last_sent_date != today_str):
-                    await self.send_processed_workbook(now, today_str)
+                    await self.send_processed_report(now, today_str)
                 
         except asyncio.CancelledError:
             LOGGER.info("Scheduled loop cancelled")
@@ -638,8 +622,8 @@ class StockReportEmail(Sensor):
     
     async def process_workbook(self, timestamp, date_str):
         """
-        Process the workbook for data from the specified date, creating a report.
-        
+        Process the Excel workbook for data from the specified date.
+
         Args:
             timestamp: Datetime object representing the processing time
             date_str: String representing the date to process (YYYYMMDD)
@@ -648,31 +632,31 @@ class StockReportEmail(Sensor):
             # Parse target date
             target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
             target_date = target_date.replace(tzinfo=tz.gettz(self.timezone))
-            LOGGER.info(f"Processing data for target date: {target_date.strftime('%Y-%m-%d')}")
-            
+            LOGGER.info(f"Processing workbook for target date: {target_date.strftime('%Y-%m-%d')}")
+
             # Define file paths
             template_path = os.path.join(self.workbooks_dir, "template.xlsx")
             raw_data_path = os.path.join(self.workbooks_dir, "raw_export.xlsx")
-            
+
             # Verify template exists
             if not os.path.exists(template_path):
                 LOGGER.error(f"Template file not found: {template_path}")
                 self.workbook = "error: missing template"
                 self._save_state()
                 return None
-            
+
             # Get store hours for the target date
             opening_time, closing_time = self._get_store_hours_for_date(target_date)
-            
+
             # Create datetime objects for the store hours
             open_hour, open_minute = map(int, opening_time.split(':'))
             close_hour, close_minute = map(int, closing_time.split(':'))
-            
+
             start_time = target_date.replace(hour=open_hour, minute=open_minute, second=0, microsecond=0)
             end_time = target_date.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
-            
+
             LOGGER.info(f"Exporting data from {start_time} to {end_time}")
-            
+
             # Export raw data
             exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.timezone)
             await exporter.export_to_excel(
@@ -685,42 +669,42 @@ class StockReportEmail(Sensor):
                 include_keys_regex=".*_raw",
                 tab_name="RAW"
             )
-            
+
             LOGGER.info(f"Raw data exported to {raw_data_path}")
-            
-            # Create WIP file with new naming convention
-            wip_filename = f"{self.filename_prefix}_wip_{target_date.strftime('%Y%m%d')}.xlsx"
+
+            # Create WIP file with naming convention
+            wip_filename = f"{target_date.strftime('%Y%m%d')}_{self.name}_wip.xlsx"
             wip_path = os.path.join(self.workbooks_dir, wip_filename)
-            
-            # Create final filename with new convention
-            final_filename = f"{self.filename_prefix}_{target_date.strftime('%Y%m%d')}.xlsx"
+
+            # Create final filename with convention
+            final_filename = f"{target_date.strftime('%Y%m%d')}_{self.name}.xlsx"
             final_path = os.path.join(self.workbooks_dir, final_filename)
-            
+
             # Copy template to WIP file
             shutil.copy(template_path, wip_path)
-            
+
             # Process the raw data and update the workbook
             num_data_rows = self._update_raw_import_sheet(raw_data_path, wip_path)
             LOGGER.info(f"Updated Raw Import sheet with {num_data_rows} rows")
-            
+
             # Fix the workbook
             self._fix_workbook(wip_path, num_data_rows, final_path)
-            LOGGER.info(f"Created final report: {final_path}")
+            LOGGER.info(f"Created final workbook: {final_path}")
 
             # Clean up WIP file
             if os.path.exists(wip_path):
                 os.remove(wip_path)
                 LOGGER.info(f"Removed temporary WIP file: {wip_path}")
-            
+
             # Update state
             self.data = final_path
             self.last_processed_date = date_str
             self.last_processed_time = str(timestamp)
             self.workbook = "processed"
             self._save_state()
-            
+
             return final_path
-            
+
         except Exception as e:
             LOGGER.error(f"Failed to process workbook: {e}")
             self.workbook = f"error: {str(e)}"
@@ -731,26 +715,16 @@ class StockReportEmail(Sensor):
         """Get store hours for the specified date."""
         # Get day of week (0=Monday, 6=Sunday)
         weekday = date.weekday()
-        
-        # Map weekday to store hours
-        if weekday == 0:  # Monday
-            return tuple(self.hours_mon)
-        elif weekday == 1:  # Tuesday
-            return tuple(self.hours_tue)
-        elif weekday == 2:  # Wednesday
-            return tuple(self.hours_wed)
-        elif weekday == 3:  # Thursday
-            return tuple(self.hours_thu)
-        elif weekday == 4:  # Friday
-            return tuple(self.hours_fri)
-        elif weekday == 5:  # Saturday
-            return tuple(self.hours_sat)
-        else:  # Sunday
-            return tuple(self.hours_sun)
+
+        # Check if it's a weekend (Saturday=5, Sunday=6)
+        if weekday == 5 or weekday == 6:  # Saturday or Sunday
+            return tuple(self.hours_weekends)
+        else:  # Weekdays (Monday to Friday)
+            return tuple(self.hours_weekdays)
     
     def _update_raw_import_sheet(self, raw_file, output_file):
         """
-        Update the Raw Import sheet in the output file with data from the raw file.
+        Update the Raw Import sheet in the output workbook with data from the raw file.
         
         Args:
             raw_file: Path to the raw data Excel file
@@ -810,10 +784,10 @@ class StockReportEmail(Sensor):
     
     def _get_sheet_mappings(self, excel_path):
         """
-        Extract the mapping of sheet names to their XML filenames.
+        Extract the mapping of sheet names to their XML filenames in the workbook.
         
         Args:
-            excel_path: Path to the Excel file
+            excel_path: Path to the Excel workbook file
             
         Returns:
             Dictionary mapping sheet names to XML filenames
@@ -980,7 +954,7 @@ class StockReportEmail(Sensor):
                     raise
             
             # Create the final zip file (Excel file)
-            LOGGER.info(f"Creating final Excel file: {final_path}")
+            LOGGER.info(f"Creating final workbook file: {final_path}")
             with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zip_out:
                 for root_dir, _, files in os.walk(temp_dir):
                     for file in files:
@@ -988,7 +962,7 @@ class StockReportEmail(Sensor):
                         arcname = os.path.relpath(file_path, temp_dir)
                         zip_out.write(file_path, arcname)
             
-            LOGGER.info(f"Successfully created final Excel file: {final_path}")
+            LOGGER.info(f"Successfully created final workbook: {final_path}")
             return final_path
             
         except Exception as e:
@@ -1018,10 +992,10 @@ class StockReportEmail(Sensor):
         LOGGER.info(f"Found {len(image_files)} images for {day_str}")
         return image_files
             
-    async def send_processed_workbook(self, timestamp, date_str):
-        """Send the previously processed workbook via email with optional images."""
+    async def send_processed_report(self, timestamp, date_str):
+        """Send a previously processed report via email with optional images."""
         if not self.data or not os.path.exists(self.data):
-            LOGGER.error("No processed workbook available to send")
+            LOGGER.error("No processed workbook available to send report")
             self.report = "error: no processed workbook"
             self._save_state()
             return
@@ -1042,21 +1016,21 @@ class StockReportEmail(Sensor):
                     except Exception as e:
                         LOGGER.error(f"Error annotating image {img_path}: {e}")
             
-            # Send the workbook with images
-            await self.send_workbook(self.data, timestamp, daily_images)
+            # Send the report with workbook and images
+            await self.send_report(self.data, timestamp, daily_images)
             
             self.last_sent_date = date_str
             self.last_sent_time = str(timestamp)
             self.report = "sent"
             self._save_state()
             
-            LOGGER.info(f"Sent processed workbook for {date_str} with {len(daily_images)} images")
+            LOGGER.info(f"Sent report for {date_str} with {len(daily_images)} images")
         except Exception as e:
             self.report = f"error: {str(e)}"
-            LOGGER.error(f"Failed to send workbook for {date_str}: {e}")
+            LOGGER.error(f"Failed to send report for {date_str}: {e}")
     
-    async def process_and_send(self, timestamp, date_str):
-        """Process and send the workbook immediately."""
+    async def process_and_send_report(self, timestamp, date_str):
+        """Process a workbook and send it as a report immediately."""
         try:
             workbook_path = await self.process_workbook(timestamp, date_str)
             if workbook_path:
@@ -1075,28 +1049,28 @@ class StockReportEmail(Sensor):
                         except Exception as e:
                             LOGGER.error(f"Error annotating image {img_path}: {e}")
                 
-                # Send workbook with images
-                await self.send_workbook(workbook_path, timestamp, daily_images)
+                # Send report with workbook and images
+                await self.send_report(workbook_path, timestamp, daily_images)
                 
                 self.last_sent_date = date_str
                 self.last_sent_time = str(timestamp)
                 self.report = "sent"
                 self._save_state()
                 
-                LOGGER.info(f"Processed and sent workbook for {date_str} with {len(daily_images)} images")
-                return {"status": "success", "message": f"Processed and sent workbook for {date_str} with {len(daily_images)} images"}
+                LOGGER.info(f"Processed and sent report for {date_str} with {len(daily_images)} images")
+                return {"status": "success", "message": f"Processed and sent report for {date_str} with {len(daily_images)} images"}
             else:
                 self.report = "error: processing failed"
                 return {"status": "error", "message": "Processing failed"}
         except Exception as e:
             self.report = f"error: {str(e)}"
-            LOGGER.error(f"Failed to process/send for {date_str}: {e}")
+            LOGGER.error(f"Failed to process/send report for {date_str}: {e}")
             return {"status": "error", "message": str(e)}
     
-    async def send_workbook(self, workbook_path, timestamp, image_paths=None):
+    async def send_report(self, workbook_path, timestamp, image_paths=None):
         """
-        Send the workbook report via email using SendGrid, with optional image attachments.
-        
+        Send the report via email using SendGrid, including a workbook and optional images.
+
         Args:
             workbook_path: Path to the workbook file
             timestamp: Datetime object representing the send time
@@ -1105,111 +1079,124 @@ class StockReportEmail(Sensor):
         if not self.sendgrid_api_key:
             LOGGER.error("No SendGrid API key configured")
             raise ValueError("No SendGrid API key configured")
-        
+
         if not os.path.exists(workbook_path):
             LOGGER.error(f"Workbook file not found: {workbook_path}")
             raise FileNotFoundError(f"Workbook file not found: {workbook_path}")
-        
+
         try:
             # Prepare email content
-            LOGGER.info(f"Preparing email with workbook: {os.path.basename(workbook_path)}")
-            
+            LOGGER.info(f"Preparing report email with workbook: {os.path.basename(workbook_path)}")
+
             # Updated email subject format
             subject = f"Daily Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
-            
-            # Updated email body with hyperlink to teleop and mention of images if included
-            teleop_url = self.teleop_url if hasattr(self, 'teleop_url') and self.teleop_url else "#"
-            
-            # Base email text
-            base_text = f"See the attached Excel workbook with data for review. "
-            
-            # Add teleop link if configured
-            if teleop_url and teleop_url != "#":
-                base_text += f"Click here for the link to the real-time view of the store: {teleop_url}"
-            
-            # Add text about images if any are attached
+
+            # Base email text with single newlines (matching stock-alert style)
+            base_text = "The Excel workbook is attached with data for review.\n"
+            base_text += f"Location: {self.location}\n"
+
+            # Add image count if images are attached
             if image_paths and len(image_paths) > 0:
-                base_text += f"\n\nThis email includes {len(image_paths)} images captured during the day."
-            
-            body_text = base_text
-            
+                base_text += f"Also attached are {len(image_paths)} images captured during the day.\n"
+
+            # Add teleop link if configured, with "here" as the clickable part
+            if self.teleop_url and self.teleop_url != "#":
+                base_text += f"Click here for the link to a real-time view of the store: {self.teleop_url}"
+
             # Create email message
             message = Mail(
                 from_email=Email(self.sender_email, self.sender_name),
                 to_emails=self.recipients,
                 subject=subject,
-                plain_text_content=Content("text/plain", body_text)
+                plain_text_content=Content("text/plain", base_text)
             )
-            
-            # Add HTML version with hyperlink
+
+            # Create HTML version with "here" as the hyperlink
             html_content = f"""<html>
     <body>
-    <p>See the attached Excel workbook with data for review."""
-    
-            if teleop_url and teleop_url != "#":
-                html_content += f""" <a href="{teleop_url}">Click here</a> for the link to the real-time view of the store."""
-            
+    <p>The Excel workbook is attached with data for review.</p>
+    <p>Location: {self.location}</p>"""
+
             if image_paths and len(image_paths) > 0:
-                html_content += f"""</p>
-    <p>This email includes {len(image_paths)} images captured during the day.</p>"""
-            else:
-                html_content += "</p>"
-                
+                html_content += f"""<p>Also attached are {len(image_paths)} images captured during the day.</p>"""
+
+            if self.teleop_url and self.teleop_url != "#":
+                html_content += f"""<p>Click <a href="{self.teleop_url}">here</a> for the link to a real-time view of the store.</p>"""
+
             html_content += """
     </body>
     </html>"""
-            
+
             message.add_content(Content("text/html", html_content))
-            
-            # Add the Excel workbook attachment
-            with open(workbook_path, "rb") as f:
-                file_content = base64.b64encode(f.read()).decode()
-            
-            file_name = os.path.basename(workbook_path)
-            
-            # Create workbook attachment
-            wb_attachment = Attachment()
-            wb_attachment.file_content = FileContent(file_content)
-            wb_attachment.file_name = FileName(file_name)
-            wb_attachment.file_type = FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            wb_attachment.disposition = Disposition("attachment")
-            
-            # Add workbook attachment to message
-            message.add_attachment(wb_attachment)
-            LOGGER.info(f"Added workbook attachment: {file_name}")
-            
-            # Add image attachments if any
-            if image_paths:
-                for img_path in image_paths:
+
+            # Sort and attach images first (latest to earliest)
+            if image_paths and len(image_paths) > 0:
+                # Sort images by timestamp in filename (assuming format YYYYMMDD_HHMMSS_*.jpg)
+                def sort_by_timestamp(path):
+                    filename = os.path.basename(path)
+                    # Extract timestamp part (YYYYMMDD_HHMMSS) from filename
+                    parts = filename.split('_')
+                    if len(parts) >= 2:
+                        timestamp_str = parts[0] + '_' + parts[1]  # Combine date and time parts
+                        try:
+                            # Convert to datetime for sorting
+                            return datetime.datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                        except ValueError:
+                            LOGGER.warning(f"Could not parse timestamp from {filename}, using filename as fallback")
+                            return filename
+                    return filename  # Fallback if parsing fails
+
+                # Sort image paths from latest to earliest (descending order)
+                sorted_image_paths = sorted(image_paths, key=sort_by_timestamp, reverse=True)
+
+                # Add sorted image attachments (latest to earliest)
+                for img_path in sorted_image_paths:
                     try:
                         with open(img_path, "rb") as f:
                             img_content = base64.b64encode(f.read()).decode()
-                        
+
                         img_name = os.path.basename(img_path)
-                        
+
                         # Create image attachment
                         img_attachment = Attachment()
                         img_attachment.file_content = FileContent(img_content)
                         img_attachment.file_name = FileName(img_name)
                         img_attachment.file_type = FileType("image/jpeg")
                         img_attachment.disposition = Disposition("attachment")
-                        
+
                         # Add image attachment to message
                         message.add_attachment(img_attachment)
-                        LOGGER.info(f"Added image attachment: {img_name}")
+                        LOGGER.info(f"Added image attachment to report: {img_name}")
                     except Exception as e:
-                        LOGGER.error(f"Error attaching image {img_path}: {e}")
-            
+                        LOGGER.error(f"Error attaching image to report: {img_path}: {e}")
+
+            # Add the Excel workbook attachment last
+            with open(workbook_path, "rb") as f:
+                file_content = base64.b64encode(f.read()).decode()
+
+            file_name = os.path.basename(workbook_path)
+
+            # Create workbook attachment
+            wb_attachment = Attachment()
+            wb_attachment.file_content = FileContent(file_content)
+            wb_attachment.file_name = FileName(file_name)
+            wb_attachment.file_type = FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            wb_attachment.disposition = Disposition("attachment")
+
+            # Add workbook attachment to message last
+            message.add_attachment(wb_attachment)
+            LOGGER.info(f"Added workbook attachment to report: {file_name}")
+
             # Send email
-            LOGGER.info(f"Sending email to {len(self.recipients)} recipients")
+            LOGGER.info(f"Sending report to {len(self.recipients)} recipients")
             sg = SendGridAPIClient(self.sendgrid_api_key)
             response = sg.send(message)
-            
-            LOGGER.info(f"Email sent via SendGrid API. Status code: {response.status_code}")
+
+            LOGGER.info(f"Report sent via SendGrid API. Status code: {response.status_code}")
             return True
-            
+
         except Exception as e:
-            LOGGER.error(f"Failed to send email: {e}")
+            LOGGER.error(f"Failed to send report: {e}")
             raise
     
     async def get_readings(self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs) -> Dict[str, SensorReading]:
@@ -1217,7 +1204,7 @@ class StockReportEmail(Sensor):
         now = datetime.datetime.now()
         next_process = self._get_next_process_time(now)
         next_send = self._get_next_send_time(now)
-        
+
         # Only get next capture time if image capture is enabled
         next_capture = None
         if self.include_images:
@@ -1225,15 +1212,10 @@ class StockReportEmail(Sensor):
 
         # Map store hours for display
         store_hours = {
-            "monday": self.hours_mon,
-            "tuesday": self.hours_tue,
-            "wednesday": self.hours_wed,
-            "thursday": self.hours_thu,
-            "friday": self.hours_fri,
-            "saturday": self.hours_sat,
-            "sunday": self.hours_sun
+            "weekdays": self.hours_weekdays,
+            "weekends": self.hours_weekends
         }
-        
+
         readings = {
             "last_processed_date": self.last_processed_date or "never",
             "last_processed_time": self.last_processed_time or "never",
@@ -1245,13 +1227,12 @@ class StockReportEmail(Sensor):
             "next_send_date": next_send.strftime("%Y%m%d"),
             "next_send_time": str(next_send),
             "timezone": self.timezone,
-            "filename_prefix": self.filename_prefix,
             "store_hours": store_hours,
             "report": self.report,
             "pid": os.getpid(),
             "location": self.location
         }
-        
+
         # Add image capture information if enabled
         if self.include_images:
             readings.update({
@@ -1263,7 +1244,7 @@ class StockReportEmail(Sensor):
             })
         else:
             readings["image_capture"] = "disabled"
-            
+
         return readings
     
     async def do_command(self, command: Dict[str, Any], *, timeout: Optional[float] = None, **kwargs) -> Dict[str, Any]:
@@ -1274,7 +1255,7 @@ class StockReportEmail(Sensor):
             day = command.get("day", datetime.datetime.now().strftime("%Y%m%d"))
             try:
                 timestamp = datetime.datetime.strptime(day, "%Y%m%d")
-                result = await self.process_and_send(timestamp, day)
+                result = await self.process_and_send_report(timestamp, day)
                 return result
             except ValueError:
                 return {"status": "error", "message": f"Invalid day format: {day}, use YYYYMMDD"}
@@ -1335,11 +1316,11 @@ class StockReportEmail(Sensor):
                 
                 return {
                     "status": "success",
-                    "message": f"Test email sent with status code {response.status_code}",
+                    "message": f"Test report email sent with status code {response.status_code}",
                     "recipients": self.recipients
                 }
             except Exception as e:
-                return {"status": "error", "message": f"Failed to send test email: {str(e)}"}
+                return {"status": "error", "message": f"Failed to send test report email: {str(e)}"}
         
         elif cmd == "get_schedule":
             now = datetime.datetime.now()
