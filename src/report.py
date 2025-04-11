@@ -248,20 +248,20 @@ class StockReportEmail(Sensor):
         # Store config and dependencies
         self.config = config
         self.dependencies = dependencies
-        
+
         # Get configuration attributes
         attributes = struct_to_dict(config.attributes)
-        
-        # Configure from attributes
+
+        # Base configuration
         self.location = config.attributes.fields["location"].string_value
         self.filename_prefix = attributes.get("filename_prefix", "")
         self.teleop_url = attributes.get("teleop_url", "")
-        
+
         # Email configuration
         self.sender_email = attributes.get("sender_email", "no-reply@viam.com")
         self.sender_name = attributes.get("sender_name", "Workbook Report")
         self.sendgrid_api_key = attributes.get("sendgrid_api_key", "")
-        
+
         # Handle recipients (string or list)
         recipients = attributes.get("recipients", [])
         if isinstance(recipients, list):
@@ -271,16 +271,14 @@ class StockReportEmail(Sensor):
         else:
             LOGGER.warning(f"Unexpected recipients format: {type(recipients)}")
             self.recipients = [str(recipients)]
-        
+
         # API configuration
         self.api_key_id = attributes.get("api_key_id", "")
         self.api_key = attributes.get("api_key", "")
         self.org_id = attributes.get("org_id", "")
-        
-        # Scheduling
+
+        # Scheduling configuration
         self.send_time = attributes.get("send_time", "20:00")
-        
-        # If process_time is not specified, calculate it as 1 hour before send_time
         if "process_time" in attributes:
             self.process_time = attributes.get("process_time")
         else:
@@ -288,44 +286,42 @@ class StockReportEmail(Sensor):
             send_dt = datetime.datetime.strptime(self.send_time, "%H:%M")
             process_dt = send_dt - timedelta(hours=1)
             self.process_time = process_dt.strftime("%H:%M")
-        
         self.timezone = attributes.get("timezone", "America/New_York")
-        
-        # Image capture configuration - updated for more resilience
+
+        # Image capture configuration
         self.include_images = attributes.get("include_images", False)
         if isinstance(self.include_images, str):
             self.include_images = self.include_images.lower() == "true"
-        
-        # Camera configuration
         self.camera_name = attributes.get("camera_name", "")
-        # If image capture is enabled but no camera specified, log a warning
         if self.include_images and not self.camera_name:
             LOGGER.warning("Image capture enabled but no camera_name specified")
-            # Will attempt to find first available camera at runtime
-            
+            # Will attempt to use the first available camera at runtime
+
         # Check dependencies to see if we actually have a camera
-        has_camera = False
         if self.include_images:
-            # Check if any camera is available in dependencies
+            has_camera = False
+            # Use a flexible check (supports remote cameras) via getattr() method check
             for name, resource in self.dependencies.items():
-                if isinstance(resource, Camera):
-                    has_camera = True
-                    # If no camera name specified, use the first one found
-                    if not self.camera_name:
+                if hasattr(resource, "get_image"):
+                    if self.camera_name:
+                        # Match if the configured name is a substring of the dependency name
+                        if self.camera_name.lower() in str(name).lower():
+                            has_camera = True
+                            break
+                    else:
+                        # No camera name specified; use the first available camera
                         self.camera_name = str(name)
+                        has_camera = True
                         LOGGER.info(f"No camera specified, using first found camera: {name}")
-                    break
-            
-            # Log warning if no camera found but don't disable images
-            # Will try to find camera again during capture
+                        break
             if not has_camera:
-                LOGGER.warning(f"No camera found in dependencies yet")
+                LOGGER.warning("No camera found in dependencies yet")
         
         self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
         self.image_width = int(attributes.get("image_width", 640))
         self.image_height = int(attributes.get("image_height", 480))
-        
-        # Configure store hours
+
+        # Store hours
         self.hours_mon = attributes.get("hours_mon", ["07:00", "19:30"])
         self.hours_tue = attributes.get("hours_tue", ["07:00", "19:30"])
         self.hours_wed = attributes.get("hours_wed", ["07:00", "19:30"])
@@ -333,31 +329,30 @@ class StockReportEmail(Sensor):
         self.hours_fri = attributes.get("hours_fri", ["07:00", "19:30"])
         self.hours_sat = attributes.get("hours_sat", ["08:00", "17:00"])
         self.hours_sun = attributes.get("hours_sun", ["08:00", "17:00"])
-        
+
         # Log configuration details
         LOGGER.info(f"Configured {self.name} for location '{self.location}'")
         LOGGER.info(f"Process time: {self.process_time}, Send time: {self.send_time}")
         LOGGER.info(f"Will send reports to: {', '.join(self.recipients)}")
-        
         if self.sendgrid_api_key:
             LOGGER.info("SendGrid API key configured")
         else:
             LOGGER.warning("No SendGrid API key configured")
-            
         if self.include_images:
             LOGGER.info(f"Will capture images from camera: {self.camera_name}")
             LOGGER.info(f"Capture times: {', '.join(self.capture_times)}")
         else:
             LOGGER.info("Image capture disabled")
-        
-        # Cancel existing tasks if any
+
+        # Cancel any existing scheduled tasks
         if self.loop_task and not self.loop_task.done():
             self.loop_task.cancel()
         if self.capture_task and not self.capture_task.done():
             self.capture_task.cancel()
-            
+
         # Start scheduled tasks
         self.loop_task = asyncio.create_task(self.run_scheduled_loop())
+
         
     def _get_next_process_time(self, now: datetime.datetime) -> datetime.datetime:
         """Calculate the next process time based on current time and process_time."""
