@@ -8,9 +8,10 @@ import shutil
 import zipfile
 import xml.etree.ElementTree as ET
 import openpyxl
-from typing import Mapping, Optional, Any, Dict
+from typing import Mapping, Optional, Any, Dict, List
 from viam.module.module import Module
 from viam.components.sensor import Sensor
+from viam.components.camera import Camera
 from viam.proto.app.robot import ComponentConfig
 from viam.resource.base import ResourceBase
 from viam.resource.types import Model, ModelFamily
@@ -23,6 +24,8 @@ from sendgrid.helpers.mail import (
     FileType, Disposition, Email, Content
 )
 import base64
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
 
 from .export import DataExporter
 
@@ -31,7 +34,7 @@ LOGGER = getLogger(__name__)
 class StockReportEmail(Sensor):
     """
     StockReportEmail component that generates and emails Excel workbook reports
-    based on scheduled times from Viam API data, with optional image attachments.
+    with captured images based on scheduled times from Viam API data.
     """
     
     MODEL = Model(ModelFamily("hunter", "stock-report"), "email")
@@ -83,18 +86,22 @@ class StockReportEmail(Sensor):
                     except ValueError:
                         raise ValueError(f"Invalid time format in '{day}': '{time_str}' - must be in 'HH:MM' format")
         
-        # Validate image_times if provided
-        if "image_times" in attributes:
-            image_times = attributes["image_times"]
-            if not isinstance(image_times, list):
-                raise ValueError("'image_times' must be a list")
-            for time_str in image_times:
+        # Validate capture_times if provided
+        if "capture_times" in attributes:
+            for time_str in attributes["capture_times"]:
                 try:
-                    datetime.datetime.strptime(str(time_str), "%H:%M")
+                    datetime.datetime.strptime(time_str, "%H:%M")
                 except ValueError:
-                    raise ValueError(f"Invalid time format in 'image_times': '{time_str}' - must be 'HH:MM'")
-        
-        # Return list of required dependencies (none for this component)
+                    raise ValueError(f"Invalid capture_times entry '{time_str}': must be in 'HH:MM' format")
+                    
+        # Check if camera is specified when include_images is true
+        include_images = attributes.get("include_images", False)
+        if include_images and not attributes.get("camera_name"):
+            raise ValueError("camera_name must be specified when include_images is true")
+            
+        # Similar to stock-alert pattern, don't require explicit dependencies
+        # This prevents the "unresolved dependencies" error
+        LOGGER.info(f"StockReportEmail.validate_config completed for {config.name}")
         return []
     
     def __init__(self, name: str):
@@ -105,7 +112,6 @@ class StockReportEmail(Sensor):
         
         # Base configuration
         self.location = ""
-        self.location_id = ""  # Add location_id
         self.filename_prefix = ""
         self.teleop_url = ""
         
@@ -124,7 +130,14 @@ class StockReportEmail(Sensor):
         self.send_time = "20:00"
         self.process_time = "19:00"  # Default to 1 hour before send
         self.timezone = "America/New_York"
-        self.image_times = []  # List of times for image retrieval
+        
+        # Image capture configuration
+        self.include_images = False
+        self.camera_name = ""
+        self.capture_times = ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]
+        self.last_capture_time = None
+        self.image_width = 640
+        self.image_height = 480
         
         # Store hours
         self.hours_mon = ["07:00", "19:30"]
@@ -146,16 +159,19 @@ class StockReportEmail(Sensor):
         
         # Background tasks
         self.loop_task = None
+        self.capture_task = None
         
         # State persistence - Similar to stock-alert module
         self.state_dir = os.path.join(os.path.expanduser("~"), ".stock-report")
         self.state_file = os.path.join(self.state_dir, f"{name}.json")
         self.workbooks_dir = os.path.join(self.state_dir, "workbooks")
+        self.images_dir = os.path.join(self.state_dir, "images")
         self.lock_file = f"{self.state_file}.lock"
         
         # Create necessary directories
         os.makedirs(self.state_dir, exist_ok=True)
         os.makedirs(self.workbooks_dir, exist_ok=True)
+        os.makedirs(self.images_dir, exist_ok=True)
         
         # Load persisted state
         self._load_state()
@@ -177,6 +193,11 @@ class StockReportEmail(Sensor):
                             self.last_processed_time = state.get("last_processed_time")
                             self.last_sent_date = state.get("last_sent_date")
                             self.last_sent_time = state.get("last_sent_time")
+                            self.last_capture_time = (
+                                datetime.datetime.fromisoformat(state["last_capture_time"])
+                                if state.get("last_capture_time")
+                                else None
+                            )
                             self.data = state.get("data")
                             self.report = state.get("report", "not_sent")
                             self.workbook = state.get("workbook", "not_processed")
@@ -205,6 +226,7 @@ class StockReportEmail(Sensor):
                         "last_processed_time": self.last_processed_time,
                         "last_sent_date": self.last_sent_date,
                         "last_sent_time": self.last_sent_time,
+                        "last_capture_time": self.last_capture_time.isoformat() if self.last_capture_time else None,
                         "data": self.data,
                         "report": self.report,
                         "workbook": self.workbook
@@ -237,7 +259,6 @@ class StockReportEmail(Sensor):
         
         # Configure from attributes
         self.location = config.attributes.fields["location"].string_value
-        self.location_id = attributes.get("location_id", "")  # Add location_id from config
         self.filename_prefix = attributes.get("filename_prefix", "")
         self.teleop_url = attributes.get("teleop_url", "")
         
@@ -274,7 +295,16 @@ class StockReportEmail(Sensor):
             self.process_time = process_dt.strftime("%H:%M")
         
         self.timezone = attributes.get("timezone", "America/New_York")
-        self.image_times = attributes.get("image_times", [])
+        
+        # Image capture configuration
+        self.include_images = attributes.get("include_images", False)
+        if isinstance(self.include_images, str):
+            self.include_images = self.include_images.lower() == "true"
+            
+        self.camera_name = attributes.get("camera_name", "")
+        self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
+        self.image_width = int(attributes.get("image_width", 640))
+        self.image_height = int(attributes.get("image_height", 480))
         
         # Configure store hours
         self.hours_mon = attributes.get("hours_mon", ["07:00", "19:30"])
@@ -289,19 +319,25 @@ class StockReportEmail(Sensor):
         LOGGER.info(f"Configured {self.name} for location '{self.location}'")
         LOGGER.info(f"Process time: {self.process_time}, Send time: {self.send_time}")
         LOGGER.info(f"Will send reports to: {', '.join(self.recipients)}")
-        if self.image_times:
-            LOGGER.info(f"Image times configured: {', '.join(self.image_times)}")
         
         if self.sendgrid_api_key:
             LOGGER.info("SendGrid API key configured")
         else:
             LOGGER.warning("No SendGrid API key configured")
+            
+        if self.include_images:
+            LOGGER.info(f"Will capture images from camera: {self.camera_name}")
+            LOGGER.info(f"Capture times: {', '.join(self.capture_times)}")
+        else:
+            LOGGER.info("Image capture disabled")
         
-        # Cancel existing task if any
+        # Cancel existing tasks if any
         if self.loop_task and not self.loop_task.done():
             self.loop_task.cancel()
+        if self.capture_task and not self.capture_task.done():
+            self.capture_task.cancel()
             
-        # Start scheduled task
+        # Start scheduled tasks
         self.loop_task = asyncio.create_task(self.run_scheduled_loop())
         
     def _get_next_process_time(self, now: datetime.datetime) -> datetime.datetime:
@@ -319,6 +355,33 @@ class StockReportEmail(Sensor):
         if now > send_time_dt:
             send_time_dt += timedelta(days=1)
         return send_time_dt
+        
+    def _get_next_capture_time(self, now: datetime.datetime) -> datetime.datetime:
+        """Calculate the next capture time based on current time and capture_times."""
+        today = now.date()
+        tomorrow = today + timedelta(days=1)
+        
+        # Convert capture_times to datetime objects for today
+        capture_times_today = [
+            datetime.datetime.combine(today, datetime.datetime.strptime(t, "%H:%M").time())
+            for t in self.capture_times
+        ]
+        
+        # Convert capture_times to datetime objects for tomorrow
+        capture_times_tomorrow = [
+            datetime.datetime.combine(tomorrow, datetime.datetime.strptime(t, "%H:%M").time())
+            for t in self.capture_times
+        ]
+        
+        # Find the next capture time (either today or tomorrow)
+        future_captures = [dt for dt in capture_times_today + capture_times_tomorrow if dt > now]
+        if future_captures:
+            return min(future_captures)
+        else:
+            # Default to first capture time the day after tomorrow
+            day_after_tomorrow = tomorrow + timedelta(days=1)
+            return datetime.datetime.combine(day_after_tomorrow, 
+                                            datetime.datetime.strptime(self.capture_times[0], "%H:%M").time())
     
     async def run_scheduled_loop(self):
         """Run a scheduled loop that wakes up for processing and sending times."""
@@ -336,21 +399,48 @@ class StockReportEmail(Sensor):
                 
                 next_process = self._get_next_process_time(now)
                 next_send = self._get_next_send_time(now)
+                next_capture = None
+                
+                # Only calculate next capture if images are enabled
+                if self.include_images:
+                    next_capture = self._get_next_capture_time(now)
 
-                # Sleep until the earliest event (process or send)
+                # Sleep until the earliest event (process, send, or capture)
                 sleep_until_process = (next_process - now).total_seconds()
                 sleep_until_send = (next_send - now).total_seconds()
-                sleep_seconds = min(sleep_until_process, sleep_until_send)
                 
-                next_event = "process" if sleep_until_process < sleep_until_send else "send"
-                LOGGER.info(f"Sleeping for {sleep_seconds:.0f} seconds until {next_event} at "
-                          f"{next_process if next_event == 'process' else next_send}")
+                if next_capture:
+                    sleep_until_capture = (next_capture - now).total_seconds()
+                    sleep_seconds = min(sleep_until_process, sleep_until_send, sleep_until_capture)
+                    
+                    if sleep_seconds == sleep_until_capture:
+                        next_event = "capture"
+                    elif sleep_seconds == sleep_until_process:
+                        next_event = "process"
+                    else:
+                        next_event = "send"
+                else:
+                    sleep_seconds = min(sleep_until_process, sleep_until_send)
+                    next_event = "process" if sleep_seconds == sleep_until_process else "send"
+                
+                next_time = {
+                    "process": next_process,
+                    "send": next_send,
+                    "capture": next_capture
+                }.get(next_event)
+                
+                LOGGER.info(f"Sleeping for {sleep_seconds:.0f} seconds until {next_event} at {next_time}")
                 
                 await asyncio.sleep(sleep_seconds)
 
                 # Check what we woke up for
                 now = datetime.datetime.now()
                 today_str = now.strftime("%Y%m%d")
+                
+                # Check if it's time to capture
+                if self.include_images and next_capture and now >= next_capture:
+                    await self.capture_image(now)
+                    self._save_state()
                 
                 # Check if it's time to process
                 process_time_today = datetime.datetime.strptime(self.process_time, "%H:%M").time()
@@ -374,6 +464,148 @@ class StockReportEmail(Sensor):
         finally:
             lock.release()
             LOGGER.info(f"Released lock, loop exiting (PID {os.getpid()})")
+            
+    async def capture_image(self, now):
+        """Capture an image and save it to disk."""
+        if not self.include_images:
+            return None
+            
+        # Try to find camera in dependencies or as a remote resource
+        camera = None
+        
+        # First, look for camera directly in dependencies
+        camera_name = self.camera_name
+        camera_parts = camera_name.split(':')
+        
+        # Try to find based on camera name (exact or partial match)
+        for name, resource in self.dependencies.items():
+            if isinstance(resource, Camera):
+                res_name_str = str(name)
+                # Check for exact match or if camera_name is a substring of resource name
+                if res_name_str == camera_name or camera_name in res_name_str:
+                    camera = resource
+                    LOGGER.info(f"Found camera: {name}")
+                    break
+        
+        if not camera:
+            LOGGER.warning(f"Camera '{self.camera_name}' not found in dependencies")
+            return None
+            
+        # Try to capture image with retry logic
+        for attempt in range(3):
+            try:
+                LOGGER.info(f"Capturing image from camera '{self.camera_name}' (attempt {attempt + 1})")
+                
+                # Capture image
+                image = await camera.get_image(mime_type="image/jpeg")
+                
+                # Get the image data
+                today_str = now.strftime("%Y%m%d")
+                timestamp = now.strftime("%Y%m%d_%H%M%S")
+                filename = f"{timestamp}_{self.name}.jpg"
+                
+                # Create daily directory
+                daily_dir = os.path.join(self.images_dir, today_str)
+                os.makedirs(daily_dir, exist_ok=True)
+                
+                image_path = os.path.join(daily_dir, filename)
+                
+                # Handle the image data depending on its type
+                if hasattr(image, 'data'):
+                    # Use PIL to process image.data
+                    pil_image = Image.open(BytesIO(image.data))
+                    pil_image.save(image_path, "JPEG")
+                elif isinstance(image, bytes):
+                    # Direct bytes
+                    with open(image_path, "wb") as f:
+                        f.write(image)
+                elif isinstance(image, dict) and 'data' in image:
+                    # Dict with data
+                    with open(image_path, "wb") as f:
+                        f.write(image['data'])
+                else:
+                    LOGGER.warning(f"Unsupported image type: {type(image)}")
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+                        continue
+                    return None
+                    
+                self.last_capture_time = now
+                LOGGER.info(f"Saved image to {image_path}")
+                return image_path
+                
+            except Exception as e:
+                LOGGER.error(f"Error capturing image (attempt {attempt + 1}): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                else:
+                    LOGGER.error("All capture attempts failed")
+                    return None
+    
+    def annotate_image(self, image_path, font_size=20):
+        """Annotate an image with timestamp and location information."""
+        try:
+            img = Image.open(image_path)
+            draw = ImageDraw.Draw(img)
+            
+            # Extract timestamp from filename (format: YYYYMMDD_HHMMSS_*)
+            filename = os.path.basename(image_path)
+            parts = filename.split('_')
+            
+            if len(parts) >= 2:
+                # Format: YYYYMMDD_HHMMSS becomes "YYYY-MM-DD HH:MM:SS"
+                date_part = parts[0]
+                time_part = parts[1]
+                
+                if len(date_part) == 8 and len(time_part) >= 6:
+                    formatted_date = f"{date_part[0:4]}-{date_part[4:6]}-{date_part[6:8]}"
+                    formatted_time = f"{time_part[0:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                    timestamp_text = f"{formatted_date} {formatted_time}"
+                else:
+                    timestamp_text = filename
+            else:
+                timestamp_text = filename
+                
+            # Add location information
+            text = f"{timestamp_text} - {self.location}"
+            
+            # Try to use a default font
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+                
+            # Get text size
+            if font:
+                text_bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+            else:
+                # Approximate if we can't get font metrics
+                text_width = len(text) * font_size * 0.6
+                text_height = font_size * 1.2
+                
+            # Position text in bottom corner with padding
+            x = img.width - text_width - 10
+            y = img.height - text_height - 10
+            
+            # Add semi-transparent background for readability
+            draw.rectangle([x-5, y-5, x+text_width+5, y+text_height+5], 
+                          fill=(0, 0, 0, 128))
+            
+            # Draw text
+            draw.text((x, y), text, fill="white", font=font)
+            
+            # Save annotated image
+            annotated_path = image_path.replace(".jpg", "_annotated.jpg")
+            img.save(annotated_path, "JPEG")
+            LOGGER.info(f"Created annotated image: {annotated_path}")
+            
+            return annotated_path
+            
+        except Exception as e:
+            LOGGER.error(f"Error annotating image: {e}")
+            return image_path  # Return original if annotation fails
     
     async def process_workbook(self, timestamp, date_str):
         """
@@ -413,8 +645,7 @@ class StockReportEmail(Sensor):
             LOGGER.info(f"Exporting data from {start_time} to {end_time}")
             
             # Export raw data
-            # exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.timezone)
-            exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.location_id, self.timezone)
+            exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.timezone)
             await exporter.export_to_excel(
                 raw_data_path,
                 "langer_fill",
@@ -446,7 +677,7 @@ class StockReportEmail(Sensor):
             # Fix the workbook
             self._fix_workbook(wip_path, num_data_rows, final_path)
             LOGGER.info(f"Created final report: {final_path}")
-            
+
             # Clean up WIP file
             if os.path.exists(wip_path):
                 os.remove(wip_path)
@@ -740,8 +971,26 @@ class StockReportEmail(Sensor):
                 shutil.rmtree(temp_dir)
                 LOGGER.info(f"Cleaned up temporary directory: {temp_dir}")
     
+    def _get_daily_images(self, day_str):
+        """Get all captured images for a specific day."""
+        daily_dir = os.path.join(self.images_dir, day_str)
+        
+        if not os.path.exists(daily_dir):
+            LOGGER.info(f"No image directory for {day_str}")
+            return []
+            
+        # Get all jpg images in the directory
+        image_files = sorted([
+            os.path.join(daily_dir, f) 
+            for f in os.listdir(daily_dir) 
+            if f.endswith(".jpg") and not f.endswith("_annotated.jpg")
+        ])
+        
+        LOGGER.info(f"Found {len(image_files)} images for {day_str}")
+        return image_files
+            
     async def send_processed_workbook(self, timestamp, date_str):
-        """Send the previously processed workbook via email."""
+        """Send the previously processed workbook via email with optional images."""
         if not self.data or not os.path.exists(self.data):
             LOGGER.error("No processed workbook available to send")
             self.report = "error: no processed workbook"
@@ -749,12 +998,30 @@ class StockReportEmail(Sensor):
             return
             
         try:
-            await self.send_workbook(self.data, timestamp)
+            # Annotate any captured images for the day
+            daily_images = []
+            
+            if self.include_images:
+                image_files = self._get_daily_images(date_str)
+                
+                # Annotate images
+                for img_path in image_files:
+                    try:
+                        annotated_path = self.annotate_image(img_path)
+                        if annotated_path:
+                            daily_images.append(annotated_path)
+                    except Exception as e:
+                        LOGGER.error(f"Error annotating image {img_path}: {e}")
+            
+            # Send the workbook with images
+            await self.send_workbook(self.data, timestamp, daily_images)
+            
             self.last_sent_date = date_str
             self.last_sent_time = str(timestamp)
             self.report = "sent"
             self._save_state()
-            LOGGER.info(f"Sent processed workbook for {date_str}")
+            
+            LOGGER.info(f"Sent processed workbook for {date_str} with {len(daily_images)} images")
         except Exception as e:
             self.report = f"error: {str(e)}"
             LOGGER.error(f"Failed to send workbook for {date_str}: {e}")
@@ -764,13 +1031,31 @@ class StockReportEmail(Sensor):
         try:
             workbook_path = await self.process_workbook(timestamp, date_str)
             if workbook_path:
-                await self.send_workbook(workbook_path, timestamp)
+                # Get daily images
+                daily_images = []
+                
+                if self.include_images:
+                    image_files = self._get_daily_images(date_str)
+                    
+                    # Annotate images
+                    for img_path in image_files:
+                        try:
+                            annotated_path = self.annotate_image(img_path)
+                            if annotated_path:
+                                daily_images.append(annotated_path)
+                        except Exception as e:
+                            LOGGER.error(f"Error annotating image {img_path}: {e}")
+                
+                # Send workbook with images
+                await self.send_workbook(workbook_path, timestamp, daily_images)
+                
                 self.last_sent_date = date_str
                 self.last_sent_time = str(timestamp)
                 self.report = "sent"
                 self._save_state()
-                LOGGER.info(f"Processed and sent workbook for {date_str}")
-                return {"status": "success", "message": f"Processed and sent workbook for {date_str}"}
+                
+                LOGGER.info(f"Processed and sent workbook for {date_str} with {len(daily_images)} images")
+                return {"status": "success", "message": f"Processed and sent workbook for {date_str} with {len(daily_images)} images"}
             else:
                 self.report = "error: processing failed"
                 return {"status": "error", "message": "Processing failed"}
@@ -779,28 +1064,47 @@ class StockReportEmail(Sensor):
             LOGGER.error(f"Failed to process/send for {date_str}: {e}")
             return {"status": "error", "message": str(e)}
     
-    async def send_workbook(self, workbook_path, timestamp):
+    async def send_workbook(self, workbook_path, timestamp, image_paths=None):
         """
         Send the workbook report via email using SendGrid, with optional image attachments.
         
         Args:
             workbook_path: Path to the workbook file
             timestamp: Datetime object representing the send time
+            image_paths: Optional list of paths to images to attach
         """
         if not self.sendgrid_api_key:
             LOGGER.error("No SendGrid API key configured")
             raise ValueError("No SendGrid API key configured")
-    
+        
         if not os.path.exists(workbook_path):
             LOGGER.error(f"Workbook file not found: {workbook_path}")
             raise FileNotFoundError(f"Workbook file not found: {workbook_path}")
         
         try:
+            # Prepare email content
             LOGGER.info(f"Preparing email with workbook: {os.path.basename(workbook_path)}")
-            subject = f"Daily Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
-            teleop_url = self.teleop_url if hasattr(self, 'teleop_url') and self.teleop_url else "#"
-            body_text = f"See the attached Excel with data for review. Click here for the link to the real-time view of the store: {teleop_url}"
             
+            # Updated email subject format
+            subject = f"Daily Report: {timestamp.strftime('%Y-%m-%d')} - {self.location}"
+            
+            # Updated email body with hyperlink to teleop and mention of images if included
+            teleop_url = self.teleop_url if hasattr(self, 'teleop_url') and self.teleop_url else "#"
+            
+            # Base email text
+            base_text = f"See the attached Excel workbook with data for review. "
+            
+            # Add teleop link if configured
+            if teleop_url and teleop_url != "#":
+                base_text += f"Click here for the link to the real-time view of the store: {teleop_url}"
+            
+            # Add text about images if any are attached
+            if image_paths and len(image_paths) > 0:
+                base_text += f"\n\nThis email includes {len(image_paths)} images captured during the day."
+            
+            body_text = base_text
+            
+            # Create email message
             message = Mail(
                 from_email=Email(self.sender_email, self.sender_name),
                 to_emails=self.recipients,
@@ -808,137 +1112,66 @@ class StockReportEmail(Sensor):
                 plain_text_content=Content("text/plain", body_text)
             )
             
+            # Add HTML version with hyperlink
             html_content = f"""<html>
     <body>
-    <p>See the attached Excel with data for review. <a href="{teleop_url}">Click here</a> for the link to the real-time view of the store.</p>
+    <p>See the attached Excel workbook with data for review."""
+    
+            if teleop_url and teleop_url != "#":
+                html_content += f""" <a href="{teleop_url}">Click here</a> for the link to the real-time view of the store."""
+            
+            if image_paths and len(image_paths) > 0:
+                html_content += f"""</p>
+    <p>This email includes {len(image_paths)} images captured during the day.</p>"""
+            else:
+                html_content += "</p>"
+                
+            html_content += """
     </body>
     </html>"""
             
-            # Add images if configured
-            attached_images = []
-            if self.image_times:
-                target_date = datetime.datetime.strptime(self.last_processed_date, "%Y%m%d").date()
-                local_tz = tz.gettz(self.timezone)
-                
-                # Create a new client connection specifically for image retrieval
-                LOGGER.info("Creating new connection for image retrieval")
-                exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.location_id, self.timezone)
-                client = await exporter.connect()
-                
-                if client and client.data_client:
-                    try:
-                        # Get store hours and convert image times to datetime objects
-                        opening_time, closing_time = self._get_store_hours_for_date(target_date)
-                        open_hour, open_minute = map(int, opening_time.split(':'))
-                        close_hour, close_minute = map(int, closing_time.split(':'))
-                        
-                        start_time = datetime.datetime.combine(target_date, datetime.time(open_hour, open_minute), tzinfo=local_tz)
-                        end_time = datetime.datetime.combine(target_date, datetime.time(close_hour, close_minute), tzinfo=local_tz)
-                        
-                        desired_times = []
-                        for time_str in self.image_times:
-                            hour, minute = map(int, time_str.split(':'))
-                            dt_local = datetime.datetime.combine(target_date, datetime.time(hour, minute), tzinfo=local_tz)
-                            desired_times.append(dt_local)
-                        
-                        LOGGER.info(f"Fetching images for times: {', '.join(self.image_times)}")
-                        
-                        # Retrieve images one by one instead of all at once
-                        images_dir = os.path.join(self.state_dir, "images")
-                        os.makedirs(images_dir, exist_ok=True)
-                        
-                        for dt_local in desired_times:
-                            try:
-                                # Create filter for this specific time
-                                from viam.proto.app.data import CaptureInterval, Order, Filter
-                                from google.protobuf.timestamp_pb2 import Timestamp
-                                
-                                # Target 5 minutes before and after the desired time
-                                start_dt = dt_local - datetime.timedelta(minutes=5)
-                                end_dt = dt_local + datetime.timedelta(minutes=5)
-                                
-                                start_ts = Timestamp()
-                                start_ts.FromDatetime(start_dt.astimezone(pytz.utc))
-                                end_ts = Timestamp()
-                                end_ts.FromDatetime(end_dt.astimezone(pytz.utc))
-                                
-                                capture_interval = CaptureInterval(start=start_ts, end=end_ts)
-                                filter = Filter(
-                                    component_name="ffmpeg",
-                                    method="ReadImage",
-                                    interval=capture_interval,
-                                    organization_ids=[self.org_id]
-                                )
-                                
-                                LOGGER.info(f"Looking for image around {dt_local.strftime('%H:%M')}")
-                                
-                                # Get images within this time window
-                                images, _, _ = await client.data_client.binary_data_by_filter(
-                                    filter=filter,
-                                    include_binary_data=True,
-                                    limit=1,
-                                    sort_order=Order.ORDER_ASCENDING
-                                )
-                                
-                                if images and len(images) > 0:
-                                    # Save image to disk
-                                    time_str = dt_local.strftime("%H%M")
-                                    temp_image_path = os.path.join(images_dir, f"image_{time_str}.jpg")
-                                    
-                                    with open(temp_image_path, "wb") as f:
-                                        f.write(images[0].binary)
-                                    
-                                    LOGGER.info(f"Saved image for {time_str} to {temp_image_path}")
-                                    
-                                    # Attach to email
-                                    with open(temp_image_path, "rb") as f:
-                                        file_content = base64.b64encode(f.read()).decode()
-                                    
-                                    filename = f"image_{time_str}.jpg"
-                                    attachment = Attachment()
-                                    attachment.file_content = FileContent(file_content)
-                                    attachment.file_name = FileName(filename)
-                                    attachment.file_type = FileType("image/jpeg")
-                                    attachment.disposition = Disposition("attachment")
-                                    message.add_attachment(attachment)
-                                    
-                                    attached_images.append(f"{filename} ({dt_local.strftime('%H:%M')})")
-                                    LOGGER.info(f"Added image attachment: {filename}")
-                                else:
-                                    LOGGER.warning(f"No images found for time {dt_local.strftime('%H:%M')}")
-                            
-                            except Exception as e:
-                                LOGGER.error(f"Error retrieving image for {dt_local.strftime('%H:%M')}: {e}")
-                        
-                    except Exception as e:
-                        LOGGER.error(f"Error in image retrieval process: {e}")
-                    finally:
-                        # Always close the client when done
-                        await client.close()
-                else:
-                    LOGGER.error("Failed to create client for image retrieval")
-            
-            # Update email content with image information
-            if attached_images:
-                images_text = "Attached images:\n" + "\n".join(attached_images)
-                body_text += "\n\n" + images_text
-                html_content = html_content.replace("</body>", f"<p>Attached images:<br>{'<br>'.join(attached_images)}</p></body>")
-            
             message.add_content(Content("text/html", html_content))
             
-            # Attach the workbook
+            # Add the Excel workbook attachment
             with open(workbook_path, "rb") as f:
                 file_content = base64.b64encode(f.read()).decode()
             
             file_name = os.path.basename(workbook_path)
-            attachment = Attachment()
-            attachment.file_content = FileContent(file_content)
-            attachment.file_name = FileName(file_name)
-            attachment.file_type = FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            attachment.disposition = Disposition("attachment")
-            message.add_attachment(attachment)
             
-            # Send the email
+            # Create workbook attachment
+            wb_attachment = Attachment()
+            wb_attachment.file_content = FileContent(file_content)
+            wb_attachment.file_name = FileName(file_name)
+            wb_attachment.file_type = FileType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            wb_attachment.disposition = Disposition("attachment")
+            
+            # Add workbook attachment to message
+            message.add_attachment(wb_attachment)
+            LOGGER.info(f"Added workbook attachment: {file_name}")
+            
+            # Add image attachments if any
+            if image_paths:
+                for img_path in image_paths:
+                    try:
+                        with open(img_path, "rb") as f:
+                            img_content = base64.b64encode(f.read()).decode()
+                        
+                        img_name = os.path.basename(img_path)
+                        
+                        # Create image attachment
+                        img_attachment = Attachment()
+                        img_attachment.file_content = FileContent(img_content)
+                        img_attachment.file_name = FileName(img_name)
+                        img_attachment.file_type = FileType("image/jpeg")
+                        img_attachment.disposition = Disposition("attachment")
+                        
+                        # Add image attachment to message
+                        message.add_attachment(img_attachment)
+                        LOGGER.info(f"Added image attachment: {img_name}")
+                    except Exception as e:
+                        LOGGER.error(f"Error attaching image {img_path}: {e}")
+            
+            # Send email
             LOGGER.info(f"Sending email to {len(self.recipients)} recipients")
             sg = SendGridAPIClient(self.sendgrid_api_key)
             response = sg.send(message)
@@ -955,6 +1188,11 @@ class StockReportEmail(Sensor):
         now = datetime.datetime.now()
         next_process = self._get_next_process_time(now)
         next_send = self._get_next_send_time(now)
+        
+        # Only get next capture time if image capture is enabled
+        next_capture = None
+        if self.include_images:
+            next_capture = self._get_next_capture_time(now)
 
         # Map store hours for display
         store_hours = {
@@ -967,7 +1205,7 @@ class StockReportEmail(Sensor):
             "sunday": self.hours_sun
         }
         
-        return {
+        readings = {
             "last_processed_date": self.last_processed_date or "never",
             "last_processed_time": self.last_processed_time or "never",
             "last_sent_date": self.last_sent_date or "never",
@@ -980,11 +1218,24 @@ class StockReportEmail(Sensor):
             "timezone": self.timezone,
             "filename_prefix": self.filename_prefix,
             "store_hours": store_hours,
-            "image_times": self.image_times,
             "report": self.report,
             "pid": os.getpid(),
             "location": self.location
         }
+        
+        # Add image capture information if enabled
+        if self.include_images:
+            readings.update({
+                "image_capture": "enabled",
+                "camera_name": self.camera_name,
+                "capture_times": self.capture_times,
+                "last_capture_time": str(self.last_capture_time) if self.last_capture_time else "never",
+                "next_capture_time": str(next_capture) if next_capture else "none scheduled"
+            })
+        else:
+            readings["image_capture"] = "disabled"
+            
+        return readings
     
     async def do_command(self, command: Dict[str, Any], *, timeout: Optional[float] = None, **kwargs) -> Dict[str, Any]:
         """Handle manual command execution."""
@@ -1019,6 +1270,22 @@ class StockReportEmail(Sensor):
                 return {"status": "success", "message": f"Sent processed workbook for {day}"}
             except ValueError:
                 return {"status": "error", "message": f"Invalid day format: {day}, use YYYYMMDD"}
+                
+        elif cmd == "capture_now":
+            if not self.include_images:
+                return {"status": "error", "message": "Image capture is disabled"}
+                
+            now = datetime.datetime.now()
+            image_path = await self.capture_image(now)
+            
+            if image_path:
+                return {
+                    "status": "success", 
+                    "message": f"Captured image at {now}",
+                    "path": image_path
+                }
+            else:
+                return {"status": "error", "message": "Failed to capture image"}
                 
         elif cmd == "test_email":
             try:
@@ -1059,15 +1326,23 @@ class StockReportEmail(Sensor):
             next_process = self._get_next_process_time(now)
             next_send = self._get_next_send_time(now)
             
-            return {
+            response = {
                 "status": "success",
                 "process_time": self.process_time,
                 "send_time": self.send_time,
                 "next_process": str(next_process),
                 "next_send": str(next_send),
-                "timezone": self.timezone,
-                "image_times": self.image_times
+                "timezone": self.timezone
             }
+            
+            if self.include_images:
+                next_capture = self._get_next_capture_time(now)
+                response.update({
+                    "capture_times": self.capture_times,
+                    "next_capture": str(next_capture)
+                })
+                
+            return response
             
         else:
             return {"status": "error", "message": f"Unknown command: {cmd}"}
