@@ -3,12 +3,12 @@
   "module_id": "hunter:stock-report",
   "visibility": "private",
   "url": "",
-  "description": "Modular sensor component: stock-report that generates and emails daily workbook reports",
+  "description": "Modular sensor component: stock-report that generates and emails daily workbook reports with captured images",
   "models": [
     {
       "api": "rdk:component:sensor",
       "model": "hunter:stock-report:email",
-      "short_description": "Exports data from Viam API, processes Excel workbooks, and emails reports on a schedule.",
+      "short_description": "Exports data from Viam API, processes Excel workbooks, captures images, and emails reports on a schedule.",
       "markdown_link": "README.md#model-hunterstockreportemail"
     }
   ],
