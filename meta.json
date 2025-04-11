@@ -1,15 +1,15 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "hunter:workbook-emailer",
+  "module_id": "hunter:stock-report",
   "visibility": "private",
   "url": "",
-  "description": "Modular sensor component: workbook-emailer",
+  "description": "Modular sensor component: stock-report that generates and emails daily workbook reports with captured images",
   "models": [
     {
       "api": "rdk:component:sensor",
-      "model": "hunter:sensor:workbook-emailer",
-      "short_description": "Provide a short (100 characters or less) description of this model here",
-      "markdown_link": "README.md#model-huntersensorworkbook-emailer"
+      "model": "hunter:stock-report:email",
+      "short_description": "Exports data from Viam API, processes Excel workbooks, captures images, and emails reports on a schedule.",
+      "markdown_link": "README.md#model-hunterstockreportemail"
     }
   ],
   "entrypoint": "./run.sh",
