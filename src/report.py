@@ -832,58 +832,71 @@ class StockReportEmail(Sensor):
                 exporter = DataExporter(self.api_key_id, self.api_key, self.org_id, self.location_id, self.timezone)
                 LOGGER.info("Attempting to connect to Viam API for image retrieval")
                 client = await exporter.connect()
+                
                 if client is None:
                     LOGGER.error("Failed to connect to Viam API for image retrieval")
                 else:
                     try:
-                        exporter.data_client = client.data_client
-                        LOGGER.info(f"Fetching images for times: {', '.join(self.image_times)}")
-                        images = await exporter.get_closest_images(
-                            component_name="ffmpeg",
-                            start_time=start_time,
-                            end_time=end_time,
-                            desired_times=desired_times
-                        )
-                        
-                        attached_images = []
-                        images_dir = os.path.join(self.state_dir, "images")
-                        os.makedirs(images_dir, exist_ok=True)  # Ensure images directory exists
-                        
-                        for dt_local, binary_data in images:
-                            if binary_data:
-                                try:
-                                    # Save binary data to a temporary file
-                                    time_str = dt_local.strftime("%H%M")
-                                    temp_image_path = os.path.join(images_dir, f"image_{time_str}.jpg")
-                                    with open(temp_image_path, "wb") as f:
-                                        f.write(binary_data.binary)
-                                    LOGGER.debug(f"Saved image to {temp_image_path}")
+                        # Make sure data_client is properly set
+                        if client.data_client is not None:
+                            exporter.data_client = client.data_client
+                            LOGGER.info(f"Fetching images for times: {', '.join(self.image_times)}")
+                            
+                            try:
+                                images = await exporter.get_closest_images(
+                                    component_name="ffmpeg",
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                    desired_times=desired_times
+                                )
 
-                                    # Read and encode the file for attachment
-                                    with open(temp_image_path, "rb") as f:
-                                        file_content = base64.b64encode(f.read()).decode()
-                                    
-                                    filename = f"image_{time_str}.jpg"
-                                    mime_type = "image/jpeg"  # Hardcoded as in send_alert
-                                    attachment = Attachment()
-                                    attachment.file_content = FileContent(file_content)
-                                    attachment.file_name = FileName(filename)
-                                    attachment.file_type = FileType(mime_type)
-                                    attachment.disposition = Disposition("attachment")
-                                    message.add_attachment(attachment)
-                                    attached_images.append(f"{filename} ({dt_local.strftime('%H:%M')})")
-                                    
-                                    # Clean up temporary file
-                                    os.remove(temp_image_path)
-                                    LOGGER.debug(f"Removed temporary image file: {temp_image_path}")
-                                except Exception as e:
-                                    LOGGER.error(f"Error processing image for {dt_local}: {e}")
-                                    continue  # Skip this image, continue with others
+                                if images:  # Make sure we have some results
+                                    attached_images = []
+                                    images_dir = os.path.join(self.state_dir, "images")
+                                    os.makedirs(images_dir, exist_ok=True)  # Ensure images directory exists
+                                
+                                for dt_local, binary_data in images:
+                                    if binary_data:
+                                        try:
+                                            # Save binary data to a temporary file
+                                            time_str = dt_local.strftime("%H%M")
+                                            temp_image_path = os.path.join(images_dir, f"image_{time_str}.jpg")
+                                            with open(temp_image_path, "wb") as f:
+                                                f.write(binary_data.binary)
+                                            LOGGER.debug(f"Saved image to {temp_image_path}")
 
-                        if attached_images:
-                            images_text = "Attached images:\n" + "\n".join(attached_images)
-                            body_text += "\n\n" + images_text
-                            html_content = html_content.replace("</body>", f"<p>Attached images:<br>{'<br>'.join(attached_images)}</p></body>")
+                                            # Read and encode the file for attachment
+                                            with open(temp_image_path, "rb") as f:
+                                                file_content = base64.b64encode(f.read()).decode()
+                                            
+                                            filename = f"image_{time_str}.jpg"
+                                            mime_type = "image/jpeg"  # Hardcoded as in send_alert
+                                            attachment = Attachment()
+                                            attachment.file_content = FileContent(file_content)
+                                            attachment.file_name = FileName(filename)
+                                            attachment.file_type = FileType(mime_type)
+                                            attachment.disposition = Disposition("attachment")
+                                            message.add_attachment(attachment)
+                                            attached_images.append(f"{filename} ({dt_local.strftime('%H:%M')})")
+                                            
+                                            # Clean up temporary file
+                                            os.remove(temp_image_path)
+                                            LOGGER.debug(f"Removed temporary image file: {temp_image_path}")
+                                        except Exception as e:
+                                            LOGGER.error(f"Error processing image for {dt_local}: {e}")
+                                            continue  # Skip this image, continue with others
+                                
+                                if attached_images:
+                                    images_text = "Attached images:\n" + "\n".join(attached_images)
+                                    body_text += "\n\n" + images_text
+                                    html_content = html_content.replace("</body>", f"<p>Attached images:<br>{'<br>'.join(attached_images)}</p></body>")
+                            
+                            except Exception as e:
+                                LOGGER.error(f"Error retrieving images: {e}")
+                                images = [(dt, None) for dt in desired_times]  # Provide empty results
+                        else:
+                            LOGGER.error("Data client is None after connection")
+                    
                     except Exception as e:
                         LOGGER.error(f"Failed to retrieve or attach images: {e}")
                     finally:

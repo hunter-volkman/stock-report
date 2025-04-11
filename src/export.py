@@ -194,71 +194,96 @@ class DataExporter:
         """
         from viam.proto.app.data import CaptureInterval, Order, BinaryID
 
-        # Convert times to UTC for API consistency
-        start_time_utc = start_time.astimezone(pytz.utc)
-        end_time_utc = end_time.astimezone(pytz.utc)
-        desired_times_utc = [dt.astimezone(pytz.utc) for dt in desired_times]
-
-        # Create filter with CaptureInterval for time range
-        start_ts = Timestamp()
-        start_ts.FromDatetime(start_time_utc)
-        end_ts = Timestamp()
-        end_ts.FromDatetime(end_time_utc)
-        capture_interval = CaptureInterval(start=start_ts, end=end_ts)
-        filter = Filter(
-            component_name=component_name,
-            method="ReadImage",
-            interval=capture_interval,
-            organization_ids=[self.org_id]
-        )
-
-        # Query image metadata, sorted by time (ascending)
-        LOGGER.info(f"Querying binary data with filter: component_name={component_name}, method=ReadImage, interval={start_time_utc} to {end_time_utc}, organization_ids={self.org_id}")
+        # Initialize default result with None values
+        result = [(dt, None) for dt in desired_times]
+        
+        if self.data_client is None:
+            LOGGER.error("Data client is None, cannot retrieve images")
+            return result
+            
         try:
-            all_images, _, _ = await self.data_client.binary_data_by_filter(
-                filter=filter,
-                include_binary_data=False,
-                sort_order=Order.ORDER_ASCENDING
+            # Convert times to UTC for API consistency
+            start_time_utc = start_time.astimezone(pytz.utc)
+            end_time_utc = end_time.astimezone(pytz.utc)
+            desired_times_utc = [dt.astimezone(pytz.utc) for dt in desired_times]
+
+            # Create filter with CaptureInterval for time range
+            start_ts = Timestamp()
+            start_ts.FromDatetime(start_time_utc)
+            end_ts = Timestamp()
+            end_ts.FromDatetime(end_time_utc)
+            capture_interval = CaptureInterval(start=start_ts, end=end_ts)
+            filter = Filter(
+                component_name=component_name,
+                method="ReadImage",
+                interval=capture_interval,
+                organization_ids=[self.org_id]
             )
-        except Exception as e:
-            LOGGER.error(f"Failed to fetch image metadata: {e}")
-            raise
 
-        if not all_images:
-            LOGGER.warning(f"No images found for {component_name} between {start_time} and {end_time}")
-            return [(dt, None) for dt in desired_times]
-
-        # Find closest image for each desired time
-        closest_ids = []
-        for dt_utc in desired_times_utc:
+            # Query image metadata, sorted by time (ascending)
+            LOGGER.info(f"Querying binary data with filter: component_name={component_name}, method=ReadImage, interval={start_time_utc} to {end_time_utc}, organization_ids={self.org_id}")
+            
             try:
-                closest_image = min(all_images, key=lambda img: abs(img.metadata.time_received.ToDatetime().replace(tzinfo=pytz.utc) - dt_utc))
-                closest_ids.append(closest_image.metadata.id)
+                all_images, _, _ = await self.data_client.binary_data_by_filter(
+                    filter=filter,
+                    include_binary_data=False,
+                    sort_order=Order.ORDER_ASCENDING
+                )
             except Exception as e:
-                LOGGER.error(f"Failed to find closest image for {dt_utc}: {e}")
-                raise
+                LOGGER.error(f"Failed to fetch image metadata: {e}")
+                return result
 
-        # Convert string IDs to BinaryID objects with all required fields
-        binary_ids = [BinaryID(
-            file_id=id_str,
-            organization_id=self.org_id,
-            location_id=self.location_id
-        ) for id_str in closest_ids]
+            if not all_images:
+                LOGGER.warning(f"No images found for {component_name} between {start_time} and {end_time}")
+                return result
 
-        # Retrieve binary data for selected images
-        LOGGER.info(f"Retrieving binary data for {len(binary_ids)} image IDs")
-        try:
-            binary_data_list = await self.data_client.binary_data_by_ids(binary_ids)
+            # Find closest image for each desired time
+            binary_ids = []
+            valid_indices = []
+            
+            for i, dt_utc in enumerate(desired_times_utc):
+                try:
+                    closest_image = min(all_images, key=lambda img: abs(img.metadata.time_received.ToDatetime().replace(tzinfo=pytz.utc) - dt_utc))
+                    
+                    # Create a BinaryID object with all required fields
+                    try:
+                        binary_id = BinaryID(
+                            file_id=closest_image.metadata.id,
+                            organization_id=self.org_id,
+                            location_id=self.location_id
+                        )
+                        binary_ids.append(binary_id)
+                        valid_indices.append(i)
+                    except Exception as e:
+                        LOGGER.error(f"Error creating BinaryID for image at time {dt_utc}: {e}")
+                except Exception as e:
+                    LOGGER.error(f"Failed to find closest image for {dt_utc}: {e}")
+
+            if not binary_ids:
+                LOGGER.warning("No valid binary IDs found")
+                return result
+                
+            # Retrieve binary data for selected images
+            LOGGER.info(f"Retrieving binary data for {len(binary_ids)} image IDs")
+            
+            try:
+                binary_data_list = await self.data_client.binary_data_by_ids(binary_ids)
+                
+                # Map binary data back to desired times
+                for i, idx in enumerate(valid_indices):
+                    if i < len(binary_data_list):
+                        result[idx] = (desired_times[idx], binary_data_list[i])
+                        
+                LOGGER.info(f"Retrieved {len(binary_data_list)} images")
+                return result
+                
+            except Exception as e:
+                LOGGER.error(f"Failed to retrieve binary data: {e}")
+                return result
+                
         except Exception as e:
-            LOGGER.error(f"Failed to retrieve binary data: {e}")
-            raise
-
-        id_to_data = {data.metadata.id: data for data in binary_data_list}
-
-        # Map back to desired times with their local representations
-        result = [(desired_times[i], id_to_data.get(closest_ids[i])) for i in range(len(desired_times))]
-        LOGGER.info(f"Retrieved {len([x for _, x in result if x is not None])} images for {len(desired_times)} requested times")
-        return result
+            LOGGER.error(f"Error in get_closest_images: {e}")
+            return result
 
     def _floor_timestamp(self, ts, bucket_td):
         """Round a timestamp down to the nearest bucket interval."""
