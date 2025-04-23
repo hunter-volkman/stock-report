@@ -444,7 +444,7 @@ class StockReportEmail(Sensor):
         return send_dt
 
     def _get_next_capture_time(self, current_time: datetime.datetime) -> datetime.datetime:
-        """Calculate the next capture time based on weekday/weekend schedules."""
+        """Calculate the next capture time (based on weekday and weekend configuration)."""
         today = current_time.date()
         tomorrow = today + datetime.timedelta(days=1)
         
