@@ -153,7 +153,10 @@ class StockReportEmail(Sensor):
         self.include_images = False
         self.image_width = 640
         self.image_height = 480
-        self.capture_times = ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]
+        # Remove single capture times
+        # self.capture_times = ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]
+        self.capture_times_weekday = ["07:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]
+        self.capture_times_weekend = ["08:00", "09:00", "11:00", "16:00"]
         self.last_capture_time = None
 
         # API configuration
@@ -302,10 +305,15 @@ class StockReportEmail(Sensor):
             process_dt = send_dt - datetime.timedelta(hours=1)
             self.process_time = process_dt.strftime("%H:%M")
         self.timezone = attributes.get("timezone", "America/New_York")
-        self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
-
+        # self.capture_times = attributes.get("capture_times", ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
+        # New schedule configuration
+        self.capture_times_weekday = attributes.get("capture_times_weekday", ["07:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00"])
+        self.capture_times_weekend = attributes.get("capture_times_weekend", ["08:00", "09:00", "11:00", "16:00"])
+        
         # Sort the capture times to ensure they're in chronological order
-        self.capture_times = sorted(list(set(self.capture_times)))
+        # self.capture_times = sorted(list(set(self.capture_times)))
+        self.capture_times_weekday = sorted(list(set(self.capture_times_weekday)))
+        self.capture_times_weekend = sorted(list(set(self.capture_times_weekend)))
 
         # Store dependencies
         self.dependencies = dependencies
@@ -326,9 +334,12 @@ class StockReportEmail(Sensor):
             LOGGER.info("SendGrid API key configured")
         else:
             LOGGER.warning("No SendGrid API key configured")
+        # Update logging
         if self.include_images:
             LOGGER.info(f"Will capture images from camera: {self.camera_name}")
-            LOGGER.info(f"Capture times: {', '.join(self.capture_times)}")
+            # LOGGER.info(f"Capture times: {', '.join(self.capture_times)}")
+            LOGGER.info(f"Weekday capture times: {', '.join(self.capture_times_weekday)}")
+            LOGGER.info(f"Weekend capture times: {', '.join(self.capture_times_weekend)}")
         else:
             LOGGER.info("Image capture disabled")
 
@@ -433,20 +444,49 @@ class StockReportEmail(Sensor):
         return send_dt
 
     def _get_next_capture_time(self, current_time: datetime.datetime) -> datetime.datetime:
-        """Calculate the next capture time."""
+        """Calculate the next capture time (based on weekday and weekend configuration)."""
         today = current_time.date()
         tomorrow = today + datetime.timedelta(days=1)
+        
+        # Determine if today and tomorrow are weekdays
+        is_today_weekday = self._is_weekday(today)
+        is_tomorrow_weekday = self._is_weekday(tomorrow)
+        
+        # Get the appropriate capture times for today and tomorrow
+        today_capture_times = self.capture_times_weekday if is_today_weekday else self.capture_times_weekend
+        tomorrow_capture_times = self.capture_times_weekday if is_tomorrow_weekday else self.capture_times_weekend
+        
+        # Create datetime objects for today's and tomorrow's capture times
         capture_times_today = [
             datetime.datetime.combine(today, datetime.time(*map(int, t.split(":"))))
-            for t in self.capture_times
+            for t in today_capture_times
         ]
         capture_times_tomorrow = [
             datetime.datetime.combine(tomorrow, datetime.time(*map(int, t.split(":"))))
-            for t in self.capture_times
+            for t in tomorrow_capture_times
         ]
+        
+        # Find all future capture times from today and tomorrow
         future_captures = [dt for dt in capture_times_today + capture_times_tomorrow if dt > current_time]
-        return min(future_captures) if future_captures else datetime.datetime.combine(
-            tomorrow + datetime.timedelta(days=1), datetime.time(*map(int, self.capture_times[0].split(":")))
+        
+        # If we have future captures, return the earliest one
+        if future_captures:
+            return min(future_captures)
+        
+        # If no captures today or tomorrow, find the next day
+        day_after_tomorrow = tomorrow + datetime.timedelta(days=1)
+        is_day_after_tomorrow_weekday = self._is_weekday(day_after_tomorrow)
+        next_day_times = self.capture_times_weekday if is_day_after_tomorrow_weekday else self.capture_times_weekend
+        
+        if next_day_times:
+            return datetime.datetime.combine(
+                day_after_tomorrow, datetime.time(*map(int, next_day_times[0].split(":")))
+            )
+        
+        # Fallback (shouldn't happen with our defaults)
+        return datetime.datetime.combine(
+            # Noon the day after tomorrow
+            day_after_tomorrow, datetime.time(12, 0)  
         )
 
     async def capture_image(self):
@@ -581,6 +621,11 @@ class StockReportEmail(Sensor):
     def _get_store_hours_for_date(self, date):
         """Get store hours for the specified date."""
         return tuple(self.hours_weekends if date.weekday() >= 5 else self.hours_weekdays)
+    
+    def _is_weekday(self, date: datetime.date) -> bool:
+        """Check if the given date is a weekday (0=Monday, 6=Sunday)."""
+        # 0-4 are the weekdays (Monday-Friday)
+        return date.weekday() < 5
 
     def _update_raw_import_sheet(self, raw_file, output_file):
         """Update the Raw Import sheet in the output workbook."""
@@ -868,6 +913,8 @@ class StockReportEmail(Sensor):
     async def get_readings(self, *, extra: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, SensorReading]:
         """Get current sensor readings."""
         now = datetime.datetime.now()
+        is_today_weekday = self._is_weekday(now.date())
+        
         next_process = self._get_next_process_time(now)
         next_send = self._get_next_send_time(now)
         next_capture = self._get_next_capture_time(now) if self.include_images else None
@@ -885,6 +932,7 @@ class StockReportEmail(Sensor):
             "timezone": self.timezone,
             "hours_weekdays": self.hours_weekdays,
             "hours_weekends": self.hours_weekends,
+            "current_day_type": "weekday" if is_today_weekday else "weekend",
             "pid": os.getpid()
         }
 
@@ -892,7 +940,9 @@ class StockReportEmail(Sensor):
             readings.update({
                 "include_images": True,
                 "camera_name": self.camera_name,
-                "capture_times": self.capture_times,
+                "capture_times_weekday": self.capture_times_weekday,
+                "capture_times_weekend": self.capture_times_weekend,
+                "current_capture_times": self.capture_times_weekday if is_today_weekday else self.capture_times_weekend,
                 "last_capture_time": str(self.last_capture_time) if self.last_capture_time else "never",
                 "next_capture_time": str(next_capture) if next_capture else "none scheduled"
             })
@@ -952,13 +1002,17 @@ class StockReportEmail(Sensor):
 
         elif cmd == "get_schedule":
             now = datetime.datetime.now()
+            is_today_weekday = self._is_weekday(now.date())
             return {
                 "status": "completed",
                 "process_time": self.process_time,
                 "send_time": self.send_time,
                 "next_process": str(self._get_next_process_time(now)),
                 "next_send": str(self._get_next_send_time(now)),
-                "capture_times": self.capture_times if self.include_images else [],
+                "current_day_type": "weekday" if is_today_weekday else "weekend",
+                "capture_times_weekday": self.capture_times_weekday if self.include_images else [],
+                "capture_times_weekend": self.capture_times_weekend if self.include_images else [],
+                "current_capture_times": (self.capture_times_weekday if is_today_weekday else self.capture_times_weekend) if self.include_images else [],
                 "next_capture": str(self._get_next_capture_time(now)) if self.include_images else "none scheduled"
             }
 
