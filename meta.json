@@ -1,14 +1,14 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "hunter:stock-report",
-  "visibility": "private",
-  "url": "",
-  "description": "Modular sensor component: stock-report that generates and emails daily workbook reports with captured images",
+  "visibility": "public",
+  "url": "https://github.com/hunter-volkman/stock-report",
+  "description": "A module to generate and send reports (e.g., email) containing Excel workbooks with stock data and optional images, scheduled for configurable process and send times. Can capture images at specified intervals when enabled.",
   "models": [
     {
       "api": "rdk:component:sensor",
       "model": "hunter:stock-report:email",
-      "short_description": "Exports data from Viam API, processes Excel workbooks, captures images, and emails reports on a schedule.",
+      "short_description": "Exports stock data into Excel workbooks, captures images, and emails reports on a schedule.",
       "markdown_link": "README.md#model-hunterstockreportemail"
     }
   ],
