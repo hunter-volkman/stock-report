@@ -26,7 +26,8 @@ Configure the model using the following JSON template in your Viam robot configu
   "timezone": "America/New_York",
   "include_images": true,
   "camera_name": "remote-1:ffmpeg",
-  "capture_times": ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"],
+  "capture_times_weekday": ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"],
+  "capture_times_weekend": ["08:00", "09:00", "11:00", "16:00"],
   "image_width": 640,
   "image_height": 480,
   "hours_mon": ["07:00", "19:30"],
@@ -62,7 +63,8 @@ The following attributes are available for this model:
 | `timezone` | string | Optional | Timezone for scheduling (default: "America/New_York"). |
 | `include_images` | string | Optional | Whether to include images in the report (default: false). |
 | `camera_name` | Required if include_images | Optional | Name of the camera component to capture images. |
-| `capture_times` | list[str] | Optional | Times to capture images (HH format, default: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]). |
+| `capture_times_weekday` | list[str] | Optional | Times to capture images (HH format, default: ["07:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00"]). |
+| `capture_times_weekend` | list[str] | Optional | Times to capture images (HH format, default: ["08:00", "09:00", "11:00", "16:00"]). |
 | `image_width` | int | Optional | Width of captured images in pixels (default: 640). |
 | `image_height` | int | Optional | Height of captured images in pixels (default: 480). |
 | `hours_mon` to `hours_sun` | list[str] | Store hours [open, close] for each day. |
@@ -86,7 +88,8 @@ The following attributes are available for this model:
     "timezone": "America/New_York",
     "include_images": true,
     "camera_name": "remote-1:ffmpeg",
-    "capture_times": ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"],
+    "capture_times_weekday": ["07:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00"],
+    "capture_times_weekend": ["08:00", "09:00", "11:00", "16:00"],
     "image_width": 640,
     "image_height": 480,
     "hours_mon": ["07:00", "19:30"],
