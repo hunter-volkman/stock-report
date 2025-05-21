@@ -32,7 +32,7 @@ from .export import DataExporter
 LOGGER = getLogger(__name__)
 
 class StockReportEmail(Sensor):
-    MODEL = Model(ModelFamily("hunter", "stock-report"), "email")
+    MODEL = Model(ModelFamily("hunter", "stock-report"), "report-email-sensor")
     
     @classmethod
     def new(cls, config: ComponentConfig, dependencies: Mapping[str, ResourceBase]) -> "StockReportEmail":

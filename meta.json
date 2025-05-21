@@ -7,9 +7,9 @@
   "models": [
     {
       "api": "rdk:component:sensor",
-      "model": "hunter:stock-report:email",
+      "model": "hunter:stock-report:report-email-sensor",
       "short_description": "Exports stock data into Excel workbooks, captures images, and emails reports on a schedule.",
-      "markdown_link": "README.md#model-hunterstockreportemail"
+      "markdown_link": "README.md#model-hunterstockreportreportemailsensor"
     }
   ],
   "entrypoint": "./run.sh",
