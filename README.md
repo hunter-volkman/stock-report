@@ -2,7 +2,7 @@
 
 This module generates and emails Excel report workbooks based on sensor data from Viam's API on a scheduled basis. It also optionally captures and attaches images throughout the day alongside the Excel report. The module features robust scheduling, state management, and support for manual commands, ensuring reliable operation even across restarts.
 
-## Model `hunter:stock-report:email`
+## Model `hunter:stock-report:report-email-sensor`
 
 A sensor component that exports data from the Viam API, processes Excel workbooks using templates, captures images at scheduled intervals (if enabled), and emails comprehensive reports on a configurable schedule. It provides both automated scheduling and manual command capabilities for processing, sending, and testing.
 
